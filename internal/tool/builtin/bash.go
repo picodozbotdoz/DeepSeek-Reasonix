@@ -265,6 +265,14 @@ func defaultBashShellPATH(ctx context.Context) string {
 	}
 	const marker = "__REASONIX_BASH_PATH__="
 	script := "printf '\\n" + marker + "%s\\n' \"$PATH\""
+	// Three fallback attempts with decreasing interactivity:
+	//   1. interactive login (-l -i): loads .bashrc for the richest PATH.
+	//      On a TTY this works instantly; in headless/ACP mode the -i flag
+	//      would block, but runShellPATHCommand below has its own hardcoded
+	//      2s timeout (NOT the bash tool's configurable foreground timeout),
+	//      so it gives up and falls through to attempt 2.
+	//   2. login shell (-l): loads profile files only — a good fallback.
+	//   3. plain shell (-c): last resort when neither startup file set PATH.
 	for _, args := range [][]string{
 		{"-l", "-i", "-c", script},
 		{"-l", "-c", script},
