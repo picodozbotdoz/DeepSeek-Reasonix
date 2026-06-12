@@ -21,6 +21,8 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,6 +31,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -90,7 +93,10 @@ func serve(in *os.File, out *os.File, learnerDir string) error {
 	w := bufio.NewWriter(out)
 	defer w.Flush()
 
-	bridge := &acpBridge{learnerDir: learnerDir}
+	pool := newACPPool(learnerDir)
+	defer pool.drain()
+
+	bridge := &acpBridge{learnerDir: learnerDir, pool: pool}
 
 	for {
 		line, err := r.ReadBytes('\n')
@@ -110,6 +116,136 @@ func serve(in *os.File, out *os.File, learnerDir string) error {
 
 type acpBridge struct {
 	learnerDir string
+	pool       *acpPool
+}
+
+// ─── ACP process pool ───────────────────────────────────────────────────
+
+const (
+	poolMaxIdle  = 8  // idle processes kept warm
+	poolMaxTotal = 16 // hard cap on concurrent processes
+	poolIdleTTL  = 60 * time.Second
+)
+
+// acpPool manages a set of reusable ACP subprocesses. Each process handles one
+// session at a time (serial prompts), but the process itself is reused across
+// tasks to avoid the 20-50MB overhead of spawning a fresh Go runtime per call.
+type acpPool struct {
+	mu      sync.Mutex
+	dir     string
+	idle    []*acpClient
+	active  int
+	total   int
+	stopCh  chan struct{}
+	stopped bool
+}
+
+func newACPPool(dir string) *acpPool {
+	p := &acpPool{
+		dir:    dir,
+		stopCh: make(chan struct{}),
+	}
+	go p.reaper()
+	return p
+}
+
+// get returns an idle ACP process or spawns a new one. The caller must call
+// put() when done (on success) or discard() (on error/timeout).
+func (p *acpPool) get() (*acpClient, error) {
+	p.mu.Lock()
+	// Try to reuse an idle process.
+	if len(p.idle) > 0 {
+		c := p.idle[len(p.idle)-1]
+		p.idle = p.idle[:len(p.idle)-1]
+		p.active++
+		p.mu.Unlock()
+		log.Printf("pool: reused idle process (active=%d idle=%d total=%d)", p.active, len(p.idle), p.total)
+		return c, nil
+	}
+	// Spawn a new process if under the cap.
+	if p.total >= poolMaxTotal {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("acp pool: at capacity (%d/%d)", p.total, poolMaxTotal)
+	}
+	p.total++
+	p.active++
+	p.mu.Unlock()
+
+	c, err := startACP(p.dir)
+	if err != nil {
+		p.mu.Lock()
+		p.total--
+		p.active--
+		p.mu.Unlock()
+		return nil, err
+	}
+	log.Printf("pool: spawned new process (active=%d idle=%d total=%d)", p.active, len(p.idle), p.total)
+	return c, nil
+}
+
+// put returns a healthy process to the idle pool after a successful session.
+func (p *acpPool) put(c *acpClient) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.active--
+	if p.stopped {
+		p.total--
+		go c.close()
+		return
+	}
+	p.idle = append(p.idle, c)
+	log.Printf("pool: returned to idle (active=%d idle=%d total=%d)", p.active, len(p.idle), p.total)
+}
+
+// discard marks a process as done without returning it to the pool (error/timeout).
+func (p *acpPool) discard(c *acpClient) {
+	p.mu.Lock()
+	p.total--
+	p.active--
+	p.mu.Unlock()
+	go c.close()
+	log.Printf("pool: discarded process (active=%d idle=%d total=%d)", p.active, len(p.idle), p.total)
+}
+
+// drain kills all idle processes. Called on bridge shutdown.
+func (p *acpPool) drain() {
+	p.mu.Lock()
+	p.stopped = true
+	idle := p.idle
+	p.idle = nil
+	p.mu.Unlock()
+	close(p.stopCh)
+	for _, c := range idle {
+		c.close()
+	}
+	log.Printf("pool: drained %d idle processes", len(idle))
+}
+
+// reaper periodically closes idle processes that have been sitting too long.
+func (p *acpPool) reaper() {
+	ticker := time.NewTicker(poolIdleTTL / 2)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case <-ticker.C:
+			p.mu.Lock()
+			if len(p.idle) <= 2 {
+				p.mu.Unlock()
+				continue
+			}
+			// Kill excess idle processes (keep 2 warm).
+			excess := p.idle[2:]
+			p.idle = p.idle[:2]
+			p.total -= len(excess)
+			p.mu.Unlock()
+			for _, c := range excess {
+				c.close()
+			}
+			log.Printf("pool: reaped %d excess idle processes", len(excess))
+		}
+	}
 }
 
 func (b *acpBridge) handleLine(line []byte, w *bufio.Writer) error {
@@ -465,12 +601,20 @@ type sessionState struct {
 	Cwd            string `json:"cwd,omitempty"`
 }
 
-func sessionStatePath(learnerDir string) string {
-	return filepath.Join(learnerDir, ".reasonix_session.json")
+// cwdKey returns a short, filesystem-safe hash of cwd for keying per-worker
+// session state files, so concurrent delegates to different cwd paths don't
+// clobber each other.
+func cwdKey(cwd string) string {
+	h := sha256.Sum256([]byte(cwd))
+	return hex.EncodeToString(h[:4]) // 8 hex chars
 }
 
-func loadSessionState(learnerDir string) (*sessionState, error) {
-	path := sessionStatePath(learnerDir)
+func sessionStatePath(learnerDir, cwd string) string {
+	return filepath.Join(learnerDir, ".reasonix_session_"+cwdKey(cwd)+".json")
+}
+
+func loadSessionState(learnerDir, cwd string) (*sessionState, error) {
+	path := sessionStatePath(learnerDir, cwd)
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -495,12 +639,12 @@ func loadSessionState(learnerDir string) (*sessionState, error) {
 	return &s, nil
 }
 
-func saveSessionState(learnerDir string, s *sessionState) error {
+func saveSessionState(learnerDir, cwd string, s *sessionState) error {
 	if s == nil {
-		os.Remove(sessionStatePath(learnerDir))
+		os.Remove(sessionStatePath(learnerDir, cwd))
 		return nil
 	}
-	path := sessionStatePath(learnerDir)
+	path := sessionStatePath(learnerDir, cwd)
 	b, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
@@ -515,11 +659,10 @@ func (b *acpBridge) delegateTask(task string, cwd string) (string, error) {
 		cwd = b.learnerDir
 	}
 
-	client, err := startACP(b.learnerDir)
+	client, err := b.pool.get()
 	if err != nil {
 		return "", err
 	}
-	defer client.close()
 
 	// 1. Initialize
 	_, _, err = client.acpCall("initialize", map[string]any{
@@ -527,6 +670,7 @@ func (b *acpBridge) delegateTask(task string, cwd string) (string, error) {
 		"clientInfo":      map[string]any{"name": "reasonix-manager", "version": version},
 	})
 	if err != nil {
+		b.pool.discard(client)
 		return "", fmt.Errorf("initialize: %w", err)
 	}
 
@@ -534,7 +678,7 @@ func (b *acpBridge) delegateTask(task string, cwd string) (string, error) {
 	sessionID := ""
 	transcriptPath := ""
 
-	prevState, err := loadSessionState(b.learnerDir)
+	prevState, err := loadSessionState(b.learnerDir, cwd)
 	if err != nil {
 		log.Printf("warning: failed to load session state: %v", err)
 	}
@@ -559,6 +703,7 @@ func (b *acpBridge) delegateTask(task string, cwd string) (string, error) {
 	if prevState == nil {
 		resultRaw, _, err := client.acpCall("session/new", map[string]any{"cwd": cwd})
 		if err != nil {
+			b.pool.discard(client)
 			return "", fmt.Errorf("session/new: %w", err)
 		}
 		var sessionResult struct {
@@ -591,6 +736,7 @@ func (b *acpBridge) delegateTask(task string, cwd string) (string, error) {
 	case res := <-promptCh:
 		if res.err != nil {
 			client.acpCall("session/close", map[string]any{"sessionId": sessionID})
+			b.pool.discard(client)
 			return "", fmt.Errorf("session/prompt: %w", res.err)
 		}
 		promptResultRaw := res.raw
@@ -611,7 +757,7 @@ func (b *acpBridge) delegateTask(task string, cwd string) (string, error) {
 		client.acpCall("session/close", map[string]any{"sessionId": sessionID})
 
 		// 5. Save session state for resumption on the next call
-		saveSessionState(b.learnerDir, &sessionState{
+		saveSessionState(b.learnerDir, cwd, &sessionState{
 			SessionID:      sessionID,
 			TranscriptPath: transcriptPath,
 			Cwd:            cwd,
@@ -622,11 +768,12 @@ func (b *acpBridge) delegateTask(task string, cwd string) (string, error) {
 		log.Printf("session %s done: reason=%s, output=%d chars",
 			sessionID, promptResult.StopReason, len(output))
 
+		b.pool.put(client)
 		return output, nil
 
 	case <-time.After(5 * time.Minute):
 		log.Printf("session %s timed out after 5 minutes, killing", sessionID)
-		client.close()
+		b.pool.discard(client)
 		return "", fmt.Errorf("delegate_task timed out after 5 minutes")
 	}
 }

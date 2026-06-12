@@ -13,6 +13,8 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/BurntSushi/toml"
 
@@ -21,6 +23,68 @@ import (
 )
 
 var validSkillName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
+
+// ─── Config cache (avoids redundant disk reads at scale) ─────────────────
+
+const configCacheTTL = 60 * time.Second
+
+type configCacheEntry struct {
+	cfg     *Config
+	loaded  time.Time
+	rootKey string // resolved root for this entry
+}
+
+var (
+	configCacheMu sync.RWMutex
+	configCache   map[string]*configCacheEntry // keyed by resolved root
+)
+
+func init() {
+	configCache = make(map[string]*configCacheEntry)
+}
+
+// invalidateConfigCache clears the in-memory config cache. Called after writes
+// so subsequent Load() calls see the fresh on-disk state.
+func invalidateConfigCache() {
+	configCacheMu.Lock()
+	configCache = make(map[string]*configCacheEntry)
+	configCacheMu.Unlock()
+}
+
+// ResetConfigCache is the exported version for tests: it clears the config
+// cache so tests don't leak state across runs.
+func ResetConfigCache() {
+	invalidateConfigCache()
+}
+
+// configCacheKey returns a cache key that includes the resolved root, working
+// directory, and HOME so tests that change environment variables don't hit each
+// other's cache entries.
+func configCacheKey(root string) string {
+	wd, _ := os.Getwd()
+	home := os.Getenv("HOME")
+	return root + "\x00" + wd + "\x00" + home
+}
+
+// cachedConfig returns a cached Config if fresh, nil otherwise. Caller holds no lock.
+func cachedConfig(rootKey string) *Config {
+	key := configCacheKey(rootKey)
+	configCacheMu.RLock()
+	e, ok := configCache[key]
+	configCacheMu.RUnlock()
+	if !ok || time.Since(e.loaded) > configCacheTTL {
+		return nil
+	}
+	return e.cfg
+}
+
+// setConfigCache stores a freshly loaded Config in the cache.
+func setConfigCache(rootKey string, cfg *Config) {
+	key := configCacheKey(rootKey)
+	configCacheMu.Lock()
+	configCache[key] = &configCacheEntry{cfg: cfg, loaded: time.Now(), rootKey: key}
+	configCacheMu.Unlock()
+}
 
 // IsValidSkillName reports whether name is a usable skill identifier.
 func IsValidSkillName(name string) bool { return validSkillName.MatchString(name) }
@@ -753,6 +817,12 @@ func Load() (*Config, error) {
 // without changing the process cwd.
 func LoadForRoot(root string) (*Config, error) {
 	root = resolveRoot(root)
+
+	// Check the in-memory cache first to avoid redundant disk reads at scale.
+	if cached := cachedConfig(root); cached != nil {
+		return cached, nil
+	}
+
 	loadDotEnvForRoot(root)
 	cfg := Default()
 
@@ -817,6 +887,7 @@ func LoadForRoot(root string) (*Config, error) {
 	if !sawConfigFile {
 		cfg.Codegraph.Enabled = false
 	}
+	setConfigCache(root, cfg)
 	return cfg, nil
 }
 

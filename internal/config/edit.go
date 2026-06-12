@@ -631,7 +631,11 @@ func validatePlugin(e PluginEntry) error {
 // half-written reasonix.toml that fails to parse on next load. Parent directories
 // are created as needed.
 func (c *Config) SaveTo(path string) error {
-	return c.SaveToScope(path, renderScopeForPath(path))
+	err := c.SaveToScope(path, renderScopeForPath(path))
+	if err == nil {
+		invalidateConfigCache()
+	}
+	return err
 }
 
 func (c *Config) SaveToScope(path string, scope RenderScope) error {
