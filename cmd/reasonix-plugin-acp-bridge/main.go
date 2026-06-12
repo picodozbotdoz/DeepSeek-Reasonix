@@ -42,18 +42,36 @@ func main() {
 	log.SetFlags(log.Ltime | log.Lshortfile)
 
 	learnerDir := "."
-	for i, arg := range os.Args[1:] {
-		if arg == "-learner-dir" && i+1 < len(os.Args[1:]) {
-			learnerDir = os.Args[2+i]
+	monoTaskACP := false
+	poolMaxIdle := defaultPoolMaxIdle
+	poolMaxTotal := defaultPoolMaxTotal
+
+	args := os.Args[1:]
+	for i, arg := range args {
+		switch arg {
+		case "-mono-task":
+			monoTaskACP = true
+		case "-pool-max-idle":
+			if i+1 < len(args) {
+				fmt.Sscanf(args[i+1], "%d", &poolMaxIdle)
+			}
+		case "-pool-max-total":
+			if i+1 < len(args) {
+				fmt.Sscanf(args[i+1], "%d", &poolMaxTotal)
+			}
+		case "-learner-dir":
+			if i+1 < len(args) {
+				learnerDir = args[i+1]
+			}
 		}
 	}
 	absDir, err := filepath.Abs(learnerDir)
 	if err != nil {
 		log.Fatalf("resolving -learner-dir: %v", err)
 	}
-	log.Printf("learner dir: %s", absDir)
+	log.Printf("learner dir: %s, monoTaskACP: %v, pool: idle=%d total=%d", absDir, monoTaskACP, poolMaxIdle, poolMaxTotal)
 
-	if err := serve(os.Stdin, os.Stdout, absDir); err != nil {
+	if err := serve(os.Stdin, os.Stdout, absDir, monoTaskACP, poolMaxIdle, poolMaxTotal); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -88,15 +106,18 @@ const (
 
 // ─── MCP server loop ────────────────────────────────────────────────────
 
-func serve(in *os.File, out *os.File, learnerDir string) error {
+func serve(in *os.File, out *os.File, learnerDir string, monoTaskACP bool, maxIdle, maxTotal int) error {
 	r := bufio.NewReader(in)
 	w := bufio.NewWriter(out)
 	defer w.Flush()
 
-	pool := newACPPool(learnerDir)
-	defer pool.drain()
+	var pool *acpPool
+	if !monoTaskACP {
+		pool = newACPPool(learnerDir, maxIdle, maxTotal)
+		defer pool.drain()
+	}
 
-	bridge := &acpBridge{learnerDir: learnerDir, pool: pool}
+	bridge := &acpBridge{learnerDir: learnerDir, pool: pool, monoTaskACP: monoTaskACP}
 
 	for {
 		line, err := r.ReadBytes('\n')
@@ -115,35 +136,46 @@ func serve(in *os.File, out *os.File, learnerDir string) error {
 }
 
 type acpBridge struct {
-	learnerDir string
-	pool       *acpPool
+	learnerDir  string
+	pool        *acpPool
+	monoTaskACP bool
 }
 
 // ─── ACP process pool ───────────────────────────────────────────────────
 
 const (
-	poolMaxIdle  = 8  // idle processes kept warm
-	poolMaxTotal = 16 // hard cap on concurrent processes
-	poolIdleTTL  = 60 * time.Second
+	defaultPoolMaxIdle  = 1
+	defaultPoolMaxTotal = 1
+	poolIdleTTL         = 60 * time.Second
 )
 
 // acpPool manages a set of reusable ACP subprocesses. Each process handles one
 // session at a time (serial prompts), but the process itself is reused across
 // tasks to avoid the 20-50MB overhead of spawning a fresh Go runtime per call.
 type acpPool struct {
-	mu      sync.Mutex
-	dir     string
-	idle    []*acpClient
-	active  int
-	total   int
-	stopCh  chan struct{}
-	stopped bool
+	mu       sync.Mutex
+	dir      string
+	idle     []*acpClient
+	active   int
+	total    int
+	maxIdle  int
+	maxTotal int
+	stopCh   chan struct{}
+	stopped  bool
 }
 
-func newACPPool(dir string) *acpPool {
+func newACPPool(dir string, maxIdle, maxTotal int) *acpPool {
+	if maxIdle <= 0 {
+		maxIdle = defaultPoolMaxIdle
+	}
+	if maxTotal <= 0 {
+		maxTotal = defaultPoolMaxTotal
+	}
 	p := &acpPool{
-		dir:    dir,
-		stopCh: make(chan struct{}),
+		dir:      dir,
+		maxIdle:  maxIdle,
+		maxTotal: maxTotal,
+		stopCh:   make(chan struct{}),
 	}
 	go p.reaper()
 	return p
@@ -163,9 +195,9 @@ func (p *acpPool) get() (*acpClient, error) {
 		return c, nil
 	}
 	// Spawn a new process if under the cap.
-	if p.total >= poolMaxTotal {
+	if p.total >= p.maxTotal {
 		p.mu.Unlock()
-		return nil, fmt.Errorf("acp pool: at capacity (%d/%d)", p.total, poolMaxTotal)
+		return nil, fmt.Errorf("acp pool: at capacity (%d/%d)", p.total, p.maxTotal)
 	}
 	p.total++
 	p.active++
@@ -231,13 +263,13 @@ func (p *acpPool) reaper() {
 			return
 		case <-ticker.C:
 			p.mu.Lock()
-			if len(p.idle) <= 2 {
+			if len(p.idle) <= p.maxIdle {
 				p.mu.Unlock()
 				continue
 			}
-			// Kill excess idle processes (keep 2 warm).
-			excess := p.idle[2:]
-			p.idle = p.idle[:2]
+			// Kill excess idle processes (keep maxIdle warm).
+			excess := p.idle[p.maxIdle:]
+			p.idle = p.idle[:p.maxIdle]
 			p.total -= len(excess)
 			p.mu.Unlock()
 			for _, c := range excess {
@@ -659,9 +691,19 @@ func (b *acpBridge) delegateTask(task string, cwd string) (string, error) {
 		cwd = b.learnerDir
 	}
 
-	client, err := b.pool.get()
-	if err != nil {
-		return "", err
+	var client *acpClient
+	var err error
+	if b.monoTaskACP {
+		client, err = startACP(b.learnerDir)
+		if err != nil {
+			return "", err
+		}
+		defer client.close()
+	} else {
+		client, err = b.pool.get()
+		if err != nil {
+			return "", err
+		}
 	}
 
 	// 1. Initialize
@@ -670,7 +712,9 @@ func (b *acpBridge) delegateTask(task string, cwd string) (string, error) {
 		"clientInfo":      map[string]any{"name": "reasonix-manager", "version": version},
 	})
 	if err != nil {
-		b.pool.discard(client)
+		if !b.monoTaskACP {
+			b.pool.discard(client)
+		}
 		return "", fmt.Errorf("initialize: %w", err)
 	}
 
@@ -703,7 +747,9 @@ func (b *acpBridge) delegateTask(task string, cwd string) (string, error) {
 	if prevState == nil {
 		resultRaw, _, err := client.acpCall("session/new", map[string]any{"cwd": cwd})
 		if err != nil {
-			b.pool.discard(client)
+			if !b.monoTaskACP {
+				b.pool.discard(client)
+			}
 			return "", fmt.Errorf("session/new: %w", err)
 		}
 		var sessionResult struct {
@@ -736,7 +782,9 @@ func (b *acpBridge) delegateTask(task string, cwd string) (string, error) {
 	case res := <-promptCh:
 		if res.err != nil {
 			client.acpCall("session/close", map[string]any{"sessionId": sessionID})
-			b.pool.discard(client)
+			if !b.monoTaskACP {
+				b.pool.discard(client)
+			}
 			return "", fmt.Errorf("session/prompt: %w", res.err)
 		}
 		promptResultRaw := res.raw
@@ -768,12 +816,16 @@ func (b *acpBridge) delegateTask(task string, cwd string) (string, error) {
 		log.Printf("session %s done: reason=%s, output=%d chars",
 			sessionID, promptResult.StopReason, len(output))
 
-		b.pool.put(client)
+		if !b.monoTaskACP {
+			b.pool.put(client)
+		}
 		return output, nil
 
 	case <-time.After(5 * time.Minute):
 		log.Printf("session %s timed out after 5 minutes, killing", sessionID)
-		b.pool.discard(client)
+		if !b.monoTaskACP {
+			b.pool.discard(client)
+		}
 		return "", fmt.Errorf("delegate_task timed out after 5 minutes")
 	}
 }
