@@ -782,15 +782,9 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) []s
 		results[i] = outcomes[i].output
 	}
 
-	for _, batch := range partitionToolCalls(a.tools, calls) {
-		if batch.parallel && batch.end-batch.start > 1 {
-			runParallel(batch.start, batch.end, run)
-			continue
-		}
-		for i := batch.start; i < batch.end; i++ {
-			run(i)
-		}
-	}
+	batches := partitionToolCalls(a.tools, calls)
+	serverGroups := groupBatchesByServer(batches, calls)
+	runServerGroups(serverGroups, run)
 
 	for i, c := range calls {
 		o := outcomes[i]
@@ -866,6 +860,131 @@ func runParallel(start, end int, run func(int)) {
 		}()
 	}
 	wg.Wait()
+}
+
+// ─── cross-server parallel execution ────────────────────────────────────
+
+// mcpServer extracts the MCP server name from a tool name.
+// "mcp__learner1__delegate_task" → "learner1"
+// Built-in tools return "".
+func mcpServer(name string) string {
+	if !strings.HasPrefix(name, "mcp__") {
+		return ""
+	}
+	rest := strings.TrimPrefix(name, "mcp__")
+	if idx := strings.Index(rest, "__"); idx >= 0 {
+		return rest[:idx]
+	}
+	return rest
+}
+
+// serverGroup holds consecutive tool-call batches that target the same MCP
+// server. Batches within a group run serially (shared connection); different
+// groups run in parallel (separate connections).
+type serverGroup struct {
+	batches []toolCallBatch
+	server  string // MCP server name, "" for built-ins
+}
+
+// groupBatchesByServer merges consecutive serial batches that target the same
+// MCP server into a single group. Parallel (read-only) batches always start a
+// new group since they don't share a connection. Built-in tools (server="")
+// are grouped together as a single serial group.
+func groupBatchesByServer(batches []toolCallBatch, calls []provider.ToolCall) []serverGroup {
+	var groups []serverGroup
+	for _, b := range batches {
+		// Parallel batches always start a new group.
+		if b.parallel {
+			groups = append(groups, serverGroup{batches: []toolCallBatch{b}})
+			continue
+		}
+		server := ""
+		if b.start < len(calls) {
+			server = mcpServer(calls[b.start].Name)
+		}
+		// Try to merge with the last group if same server (including "" for built-ins)
+		// and the last group's last batch is also serial.
+		if len(groups) > 0 {
+			lastGroup := &groups[len(groups)-1]
+			lastBatch := lastGroup.batches[len(lastGroup.batches)-1]
+			lastServer := ""
+			if lastBatch.start < len(calls) {
+				lastServer = mcpServer(calls[lastBatch.start].Name)
+			}
+			if server == lastServer && !lastBatch.parallel {
+				lastGroup.batches = append(lastGroup.batches, b)
+				continue
+			}
+		}
+		groups = append(groups, serverGroup{batches: []toolCallBatch{b}, server: server})
+	}
+	return groups
+}
+
+// runServerGroups executes tool-call batches. Within each group, batches run
+// serially (preserving provider order). Groups with different MCP servers run
+// in parallel since they use separate connections. Built-in tool groups
+// (server="") always run in provider order.
+func runServerGroups(groups []serverGroup, run func(int)) {
+	if len(groups) <= 1 {
+		for _, g := range groups {
+			runGroup(g, run)
+		}
+		return
+	}
+	if !hasDistinctServers(groups) {
+		// All groups target the same (or no) server — run sequentially
+		// so read/write ordering within the single connection is preserved.
+		for _, g := range groups {
+			runGroup(g, run)
+		}
+		return
+	}
+	// Distinct MCP servers: groups use separate connections, so they can run
+	// in parallel without ordering conflicts.
+	var wg sync.WaitGroup
+	for _, g := range groups {
+		g := g
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runGroup(g, run)
+		}()
+	}
+	wg.Wait()
+}
+
+// hasDistinctServers returns true when serverGroups span at least two different
+// named MCP servers (server != ""), meaning there are distinct connections that
+// can safely run in parallel. When all groups target the same server or are
+// built-ins (server=""), they share a connection and must run sequentially.
+func hasDistinctServers(groups []serverGroup) bool {
+	var seen string
+	for _, g := range groups {
+		if g.server == "" {
+			continue
+		}
+		if seen == "" {
+			seen = g.server
+		} else if g.server != seen {
+			return true
+		}
+	}
+	return false
+}
+
+// runGroup executes one serverGroup's batches serially (they share a single MCP
+// connection). Within each batch, parallel read-only calls still fan out.
+func runGroup(g serverGroup, run func(int)) {
+	for _, b := range g.batches {
+		if b.parallel && b.end-b.start > 1 {
+			runParallel(b.start, b.end, run)
+		} else {
+			for i := b.start; i < b.end; i++ {
+				run(i)
+			}
+		}
+	}
 }
 
 // stormBreakThreshold is how many times in a row the same tool may fail the same
