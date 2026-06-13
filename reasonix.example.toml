@@ -193,3 +193,11 @@ bash_timeout_seconds = 120   # foreground safety cap; set 0 for no tool-local ca
 # account_id = "default"
 # token_env = "WEIXIN_BOT_TOKEN"
 # api_base  = "https://ilinkai.weixin.qq.com"   # Tencent iLink Bot API base URL
+
+# Context Analysis Hooks (cahooks): run LLM analysis on the context window at
+# various lifecycle points and write insights to .reasonix/meta/. The LLM call
+# reuses the exact same prefix as the next normal turn (~100% cache hit).
+# Hook definitions live in .reasonix/cahooks.json (project) or
+# ~/.reasonix/cahooks.json (global). See docs/reasonix/REQ_DESIGN_DS-CONTEXT-WINDOW-INTELLIGENCE.md
+# [cahooks]
+# enabled = false   # master switch; false disables all cahooks

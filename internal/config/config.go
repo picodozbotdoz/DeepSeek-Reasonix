@@ -121,6 +121,7 @@ type Config struct {
 	Statusline    StatuslineConfig    `toml:"statusline"`
 	LSP           LSPConfig           `toml:"lsp"`
 	Bot           BotConfig           `toml:"bot"`
+	CAHooks       CAHooksConfig       `toml:"cahooks"`
 }
 
 // UIConfig controls CLI presentation-only settings. Desktop appearance is kept in
@@ -439,6 +440,13 @@ type BotConnectionSessionMapping struct {
 	Scope         string `toml:"scope"`
 	WorkspaceRoot string `toml:"workspace_root"`
 	UpdatedAt     string `toml:"updated_at"`
+}
+
+// CAHooksConfig configures Context Analysis Hooks. The actual hook definitions
+// live in .reasonix/cahooks.json; this config section enables/disables the
+// feature and sets global defaults.
+type CAHooksConfig struct {
+	Enabled bool `toml:"enabled"` // master switch; false disables all cahooks
 }
 
 // NetworkConfig controls ordinary outbound HTTP traffic such as model providers,

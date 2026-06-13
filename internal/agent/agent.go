@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"reasonix/internal/cahooks"
 	"reasonix/internal/diff"
 	"reasonix/internal/event"
 	"reasonix/internal/evidence"
@@ -264,6 +265,10 @@ type Agent struct {
 	// stormSig: a model keeps doing the same successful write, so there is no
 	// error for the failure-only storm breaker to see.
 	repeatSuccessCounts map[string]int
+
+	// cah hooks, when non-nil, runs context analysis hooks at various lifecycle
+	// points. nil disables cahooks entirely.
+	cahooks *cahooks.Manager
 }
 
 // SetPlanMode flips the read-only gate. While true, executeOne refuses any
@@ -293,6 +298,9 @@ func (a *Agent) SetMemoryQueue(q memory.Queue) { a.memQueue = q }
 // SetPreEditHook installs the pre-edit snapshot hook (see onPreEdit). The
 // controller wires it to its per-session checkpoint store; nil disables capture.
 func (a *Agent) SetPreEditHook(fn func(diff.Change)) { a.onPreEdit = fn }
+
+// SetCAHooks installs the context analysis hooks manager. nil disables cahooks.
+func (a *Agent) SetCAHooks(m *cahooks.Manager) { a.cahooks = m }
 
 // Session returns the agent's current conversation, useful for persistence
 // hooks that need to read the message log between turns. sessMu serialises this
@@ -606,6 +614,15 @@ func (a *Agent) Run(ctx context.Context, input string) error {
 			if a.steerQueueLen() > 0 {
 				continue
 			}
+			// Fire cahooks before returning
+			if a.cahooks != nil {
+				a.fireCAHooks(ctx, cahooks.TriggerPostTurn, cahooks.State{
+					Turn:          step + 1,
+					ContextUsage:  float64(usage.PromptTokens) / float64(a.contextWindow),
+					HasToolCalls:  usedAnyTool,
+					HasFileChanges: usedAnyTool,
+				})
+			}
 			return nil // model gave a final answer
 		}
 		emptyFinalBlocks = 0
@@ -628,6 +645,14 @@ func (a *Agent) Run(ctx context.Context, input string) error {
 	// Only reached when a positive maxSteps guard is configured. The work so far
 	// is already in the session, so the user can just send another message to pick
 	// up where it left off.
+	// Fire cahooks before returning
+	if a.cahooks != nil {
+		a.fireCAHooks(ctx, cahooks.TriggerPostTurn, cahooks.State{
+			Turn:         a.maxSteps,
+			ContextUsage: 1.0, // at max steps, context is likely full
+			HasToolCalls: usedAnyTool,
+		})
+	}
 	return fmt.Errorf("paused after %d tool-call rounds (%s) — the work so far is saved; send another message to continue, or set %s higher or to 0 for no limit", a.maxSteps, a.maxStepsKey, a.maxStepsKey)
 }
 
@@ -1682,4 +1707,12 @@ func finishReasonMessage(u *provider.Usage) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// fireCAHooks triggers context analysis hooks at the end of a turn.
+func (a *Agent) fireCAHooks(ctx context.Context, trigger string, state cahooks.State) {
+	if a.cahooks == nil {
+		return
+	}
+	a.cahooks.RunHooks(ctx, trigger, state, a.session.Messages, "")
 }

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"reasonix/internal/agent"
+	"reasonix/internal/cahooks"
 	"reasonix/internal/codegraph"
 	"reasonix/internal/command"
 	"reasonix/internal/config"
@@ -622,6 +623,15 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		CompactForceRatio: cfg.Agent.CompactForceRatio,
 		ArchiveDir:        config.ArchiveDir(),
 	}, sink)
+
+	// Wire cahooks if enabled
+	if cfg.CAHooks.Enabled {
+		home, _ := os.UserHomeDir()
+		cahooksCfg := cahooks.LoadAll(root, home)
+		if cahooksCfg != nil && len(cahooksCfg.Hooks) > 0 {
+			executor.SetCAHooks(cahooks.NewManager(cahooksCfg, execProv))
+		}
+	}
 
 	// Custom slash commands (.reasonix/commands + user dir). Best-effort: a malformed
 	// file is skipped, and a load error never blocks the session.
