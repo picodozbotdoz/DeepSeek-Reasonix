@@ -55,6 +55,19 @@
 // The -mono-task flag spawns a fresh `reasonix acp` per call and kills it on
 // completion, avoiding the pool entirely. This is useful when ACP processes
 // accumulate state that must be isolated between calls.
+//
+// # Timeouts for long-running tasks
+//
+// The bridge hard-caps each delegate_task at 5 minutes by default. Use
+// -task-timeout to raise (or lower) this limit:
+//
+//	args = ["-learner-dir", "../worker", "-task-timeout", "30m"]
+//
+// A worker spawned with `reasonix acp` runs the full Reasonix agent loop; its
+// own [tools] bash_timeout_seconds (default 120s) bounds individual bash calls.
+// Set bash_timeout_seconds = 0 in the worker's reasonix.toml to disable the
+// tool-local cap, or use bash(run_in_background=true) + wait() for commands
+// that must outlive the foreground timeout.
 package main
 
 import (
@@ -77,6 +90,8 @@ import (
 
 var version = "dev"
 
+const defaultTaskTimeout = 5 * time.Minute
+
 func main() {
 	log.SetPrefix("acp-bridge: ")
 	log.SetFlags(log.Ltime | log.Lshortfile)
@@ -85,6 +100,7 @@ func main() {
 	monoTaskACP := false
 	poolMaxIdle := defaultPoolMaxIdle
 	poolMaxTotal := defaultPoolMaxTotal
+	taskTimeout := defaultTaskTimeout
 
 	args := os.Args[1:]
 	for i, arg := range args {
@@ -103,20 +119,27 @@ func main() {
 			if i+1 < len(args) {
 				learnerDir = args[i+1]
 			}
+		case "-task-timeout":
+			if i+1 < len(args) {
+				d, err := time.ParseDuration(args[i+1])
+				if err == nil && d > 0 {
+					taskTimeout = d
+				}
+			}
 		}
 	}
 	absDir, err := filepath.Abs(learnerDir)
 	if err != nil {
 		log.Fatalf("resolving -learner-dir: %v", err)
 	}
-	log.Printf("learner dir: %s, monoTaskACP: %v, pool: idle=%d total=%d", absDir, monoTaskACP, poolMaxIdle, poolMaxTotal)
+	log.Printf("learner dir: %s, monoTaskACP: %v, pool: idle=%d total=%d, taskTimeout: %s", absDir, monoTaskACP, poolMaxIdle, poolMaxTotal, taskTimeout)
 
 	wc := loadWorkerConfig(absDir)
 	if wc.Description != "" {
 		log.Printf("worker description: %q", wc.Description)
 	}
 
-	if err := serve(os.Stdin, os.Stdout, absDir, monoTaskACP, poolMaxIdle, poolMaxTotal, wc.Description); err != nil {
+	if err := serve(os.Stdin, os.Stdout, absDir, monoTaskACP, poolMaxIdle, poolMaxTotal, taskTimeout, wc.Description); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -151,7 +174,7 @@ const (
 
 // ─── MCP server loop ────────────────────────────────────────────────────
 
-func serve(in *os.File, out *os.File, learnerDir string, monoTaskACP bool, maxIdle, maxTotal int, descOverride string) error {
+func serve(in *os.File, out *os.File, learnerDir string, monoTaskACP bool, maxIdle, maxTotal int, taskTimeout time.Duration, descOverride string) error {
 	r := bufio.NewReader(in)
 	w := bufio.NewWriter(out)
 	defer w.Flush()
@@ -162,7 +185,7 @@ func serve(in *os.File, out *os.File, learnerDir string, monoTaskACP bool, maxId
 		defer pool.drain()
 	}
 
-	bridge := &acpBridge{learnerDir: learnerDir, pool: pool, monoTaskACP: monoTaskACP, descOverride: descOverride}
+	bridge := &acpBridge{learnerDir: learnerDir, pool: pool, monoTaskACP: monoTaskACP, taskTimeout: taskTimeout, descOverride: descOverride}
 
 	for {
 		line, err := r.ReadBytes('\n')
@@ -209,7 +232,8 @@ type acpBridge struct {
 	learnerDir   string
 	pool         *acpPool
 	monoTaskACP  bool
-	descOverride string // from worker.toml, overrides delegate_task description
+	taskTimeout  time.Duration // per-delegate_task timeout (default 5m)
+	descOverride string       // from worker.toml, overrides delegate_task description
 }
 
 // ─── ACP process pool ───────────────────────────────────────────────────
@@ -837,7 +861,7 @@ func (b *acpBridge) delegateTask(task string, cwd string) (string, error) {
 		log.Printf("opened new session: %s (cwd=%s)", sessionID, cwd)
 	}
 
-	// 3. Session/prompt with a 5-minute timeout
+	// 3. Session/prompt with a configurable timeout (default 5 minutes)
 	type promptResult struct {
 		raw    json.RawMessage
 		notifs []json.RawMessage
@@ -896,12 +920,12 @@ func (b *acpBridge) delegateTask(task string, cwd string) (string, error) {
 		}
 		return output, nil
 
-	case <-time.After(5 * time.Minute):
-		log.Printf("session %s timed out after 5 minutes, killing", sessionID)
+	case <-time.After(b.taskTimeout):
+		log.Printf("session %s timed out after %s, killing", sessionID, b.taskTimeout)
 		if !b.monoTaskACP {
 			b.pool.discard(client)
 		}
-		return "", fmt.Errorf("delegate_task timed out after 5 minutes")
+		return "", fmt.Errorf("delegate_task timed out after %s", b.taskTimeout)
 	}
 }
 
