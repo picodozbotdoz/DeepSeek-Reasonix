@@ -63,8 +63,11 @@
 //
 //	args = ["-learner-dir", "../worker", "-task-timeout", "30m"]
 //
-// A worker spawned with `reasonix acp` runs the full Reasonix agent loop; its
-// own [tools] bash_timeout_seconds (default 120s) bounds individual bash calls.
+// A worker spawned with `reasonix acp` runs the full Reasonix agent loop. The
+// ACP subprocess loads its config from <learnerDir>/reasonix.toml automatically
+// (the same config resolution as a normal Reasonix session), so bash timeouts
+// and other settings apply without any bridge-level changes. Its
+// [tools] bash_timeout_seconds (default 120s) bounds individual bash calls.
 // Set bash_timeout_seconds = 0 in the worker's reasonix.toml to disable the
 // tool-local cap, or use bash(run_in_background=true) + wait() for commands
 // that must outlive the foreground timeout.
