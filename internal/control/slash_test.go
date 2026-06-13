@@ -1,8 +1,11 @@
 package control
 
 import (
+	"strings"
 	"testing"
 
+	"reasonix/internal/hook"
+	"reasonix/internal/memory"
 	"reasonix/internal/skill"
 )
 
@@ -138,6 +141,11 @@ func TestSlashArgItems(t *testing.T) {
 	if !has(items, "off") || !has(items, "on") || has(items, "ask") {
 		t.Errorf("/auto-plan should offer only off/on; got %v", labelsOf(items))
 	}
+	// /reasoning-language
+	items, _ = SlashArgItems("/reasoning-language ", data)
+	if !has(items, "auto") || !has(items, "zh") || !has(items, "en") || has(items, "中文") {
+		t.Errorf("/reasoning-language should offer only auto/zh/en; got %v", labelsOf(items))
+	}
 	// /theme
 	items, _ = SlashArgItems("/theme ", data)
 	if !has(items, "auto") || !has(items, "light") || !has(items, "graphite") || !has(items, "glacier") {
@@ -156,5 +164,67 @@ func TestSlashArgItems(t *testing.T) {
 	// handled by runSkillSubcommand.
 	if items, _ := SlashArgItems("/skills li", data); len(items) != 0 {
 		t.Errorf("/skills li should not offer hidden list suggestion; got %v", labelsOf(items))
+	}
+}
+
+func TestMemoryListTextIncludesSavedMemories(t *testing.T) {
+	store := memory.Store{Dir: t.TempDir()}
+	if _, err := store.Save(memory.Memory{
+		Name:        "cache-first",
+		Title:       "Cache first",
+		Description: "Preserve prompt cache stability",
+		Type:        memory.TypeProject,
+		Body:        "Use retrieval tools instead of dynamic prefix injection.",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	c := New(Options{Memory: &memory.Set{Store: store}})
+	out := c.memoryListText()
+	for _, want := range []string{"saved memories", "[Cache first](cache-first.md)", "Preserve prompt cache stability"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("/memory output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestMemoryListTextIncludesArchivedMemories(t *testing.T) {
+	store := memory.Store{Dir: t.TempDir()}
+	if _, err := store.Save(memory.Memory{
+		Name:        "stale-plan",
+		Title:       "Stale plan",
+		Description: "Superseded by the new retrieval design",
+		Type:        memory.TypeProject,
+		Body:        "Old plan body.",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	archive, err := store.Archive("stale-plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := New(Options{Memory: &memory.Set{Store: store}})
+	out := c.memoryListText()
+	for _, want := range []string{"archived memories", "[Stale plan](" + archive + ")", "Superseded by the new retrieval design"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("/memory output missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "saved memories\n  [Stale plan]") {
+		t.Fatalf("archived memory should not appear as active saved memory:\n%s", out)
+	}
+}
+
+func TestManagementHooksTrustUsesWorkspaceRoot(t *testing.T) {
+	home := t.TempDir()
+	project := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	c := New(Options{WorkspaceRoot: project})
+	if !c.managementNotice("/hooks trust") {
+		t.Fatal("/hooks trust was not handled")
+	}
+	if !hook.IsTrusted(project, home) {
+		t.Fatal("/hooks trust did not trust the controller workspace root")
 	}
 }

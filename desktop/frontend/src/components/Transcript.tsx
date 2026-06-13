@@ -8,7 +8,12 @@ import { ProcessCompactIcon, ProcessPhaseIcon } from "./ProcessCard";
 import { ToolCard } from "./ToolCard";
 import { ChevronRight } from "lucide-react";
 import { Welcome } from "./Welcome";
+import { ReadOnlyBatch } from "./ReadOnlyBatch";
 import { getDisplayMode, onDisplayModeChange, type DisplayMode } from "../lib/displayMode";
+import { isReadOnlyTool } from "../lib/useController";
+import { useGSAPCollapse } from "../lib/useGSAPCollapse";
+import { useEntranceAnimation } from "../lib/useEntranceAnimation";
+import { useScrollManager } from "../lib/useScrollManager";
 
 type ToolItem = Extract<Item, { kind: "tool" }>;
 type AssistantItem = Extract<Item, { kind: "assistant" }>;
@@ -18,10 +23,10 @@ type QuestionAnchor = { id: string; text: string; turn: number };
 const QUESTION_NAV_MIN_COUNT = 2;
 const LiveStreamContext = createContext<LiveStream | undefined>(undefined);
 
-const LiveAssistantMessage = memo(function LiveAssistantMessage({ item, defaultExpanded = false, expandWhileStreaming = true }: { item: AssistantItem; defaultExpanded?: boolean; expandWhileStreaming?: boolean }) {
+const LiveAssistantMessage = memo(function LiveAssistantMessage({ item, defaultExpanded = false }: { item: AssistantItem; defaultExpanded?: boolean }) {
   const live = useContext(LiveStreamContext);
   const shown = live && live.id === item.id ? { ...item, text: live.text, reasoning: live.reasoning, streaming: true } : item;
-  return <AssistantMessage item={shown} defaultExpanded={defaultExpanded} expandWhileStreaming={expandWhileStreaming} />;
+  return <AssistantMessage item={shown} defaultExpanded={defaultExpanded} />;
 });
 
 // ── Layer budgets ─────────────────────────────────────────────────────────────
@@ -66,22 +71,6 @@ function scrollVersion(items: Item[]): string {
       }
     })
     .join("|");
-}
-
-function repinIfWasPinned(
-  el: HTMLDivElement,
-  stick: { current: boolean },
-  frame: { current: number | null },
-  containerHeightDelta: number,
-) {
-  const bottomDistance = el.scrollHeight - el.scrollTop - el.clientHeight;
-  if (!stick.current && bottomDistance + containerHeightDelta >= 80) return;
-  stick.current = true;
-  if (frame.current !== null) cancelAnimationFrame(frame.current);
-  frame.current = requestAnimationFrame(() => {
-    if (stick.current) el.scrollTop = el.scrollHeight;
-    frame.current = null;
-  });
 }
 
 // Summarise a warm turn for its compact card.
@@ -152,7 +141,7 @@ export function Transcript({
   actionPending = false,
   rewindDisabled = false,
   questionNavigator = true,
-  defaultExpandThinking = false,
+  rewindSignal = 0,
 }: {
   items: Item[];
   live?: LiveStream;
@@ -163,13 +152,21 @@ export function Transcript({
   actionPending?: boolean;
   rewindDisabled?: boolean;
   questionNavigator?: boolean;
-  defaultExpandThinking?: boolean;
+  rewindSignal?: number;
 }) {
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const stick = useRef(true);
-  const resizeFrame = useRef<number | null>(null);
-  const lastClientHeight = useRef<number | null>(null);
-  const lastFooterHeight = useRef<number | null>(null);
+  const {
+    scrollRef,
+    stick,
+    onScroll,
+    smoothScrollTo,
+    trackQuestions,
+    repinIfWasPinned,
+    resizeFrame,
+    lastClientHeight,
+    lastFooterHeight,
+  } = useScrollManager();
+  const sessionKey = useMemo(() => `${items[0]?.id ?? ""}|${items[items.length - 1]?.id ?? ""}`, [items]);
+  const entranceRef = useEntranceAnimation<HTMLDivElement>(sessionKey, items.length);
 
   const [displayMode, setDisplayMode] = useState<DisplayMode>(() => getDisplayMode());
   useEffect(() => onDisplayModeChange((mode) => setDisplayMode(mode)), []);
@@ -186,40 +183,21 @@ export function Transcript({
   }, [items]);
   const showQuestionNav = questionNavigator && questions.length >= QUESTION_NAV_MIN_COUNT;
 
-  const onScroll = () => {
-    const el = scrollRef.current;
-    if (el) stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-  };
+  // Track question count and auto-scroll on new messages.
+  useEffect(() => { trackQuestions(questions.length); }, [questions.length, trackQuestions]);
 
-  // Track question count so we can detect when the user sends a new message.
-  const prevQuestionsLen = useRef(0);
-
-  // When the user submits a new message (questions array grows), force-scroll
-  // to the bottom regardless of the current stick state.
-  useEffect(() => {
-    if (questions.length > prevQuestionsLen.current) {
-      stick.current = true;
-      const el = scrollRef.current;
-      if (el) {
-        requestAnimationFrame(() => {
-          el.scrollTop = el.scrollHeight;
-        });
-      }
-    }
-    prevQuestionsLen.current = questions.length;
-  }, [questions]);
-
+  // Auto-scroll to bottom during streaming — instant, no GSAP tween.
+  // A 120ms tween during fast streaming is perpetually killed/restarted
+  // before reaching the target, causing visible jitter.  Direct scrollTop
+  // assignment is synchronous and always hits the exact bottom.
   const contentVersion = useMemo(() => scrollVersion(items), [items]);
   useEffect(() => {
     if (!stick.current) return;
     const el = scrollRef.current;
-    if (!el) return;
-    const id = requestAnimationFrame(() => {
-      el.scrollTop = el.scrollHeight;
-    });
-    return () => cancelAnimationFrame(id);
+    if (el) el.scrollTop = el.scrollHeight;
   }, [contentVersion, live?.text?.length ?? 0, live?.reasoning?.length ?? 0]);
 
+  // ResizeObserver for container height changes.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el || typeof ResizeObserver === "undefined") return;
@@ -227,7 +205,7 @@ export function Transcript({
     const observer = new ResizeObserver(() => {
       const previous = lastClientHeight.current ?? el.clientHeight;
       lastClientHeight.current = el.clientHeight;
-      repinIfWasPinned(el, stick, resizeFrame, el.clientHeight - previous);
+      repinIfWasPinned(el.clientHeight - previous);
     });
     observer.observe(el);
     return () => {
@@ -239,19 +217,26 @@ export function Transcript({
     };
   }, []);
 
+  // Footer height changes → smooth scroll repin with GSAP.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
     const previous = lastFooterHeight.current ?? footerHeight;
     lastFooterHeight.current = footerHeight;
-    repinIfWasPinned(el, stick, resizeFrame, previous - footerHeight);
-    return () => {
-      if (resizeFrame.current !== null) {
-        cancelAnimationFrame(resizeFrame.current);
-        resizeFrame.current = null;
-      }
-    };
+    repinIfWasPinned(previous - footerHeight);
   }, [footerHeight]);
+
+  // After a non-fork rewind, scroll to the last user message (the
+  // rewound-to point) so the user knows where they are.
+  useEffect(() => {
+    if (rewindSignal <= 0 || questions.length === 0) return;
+    const lastQ = questions[questions.length - 1];
+    const el = document.getElementById(questionAnchorId(lastQ.id));
+    if (!el || !scrollRef.current) return;
+    stick.current = false;
+    scrollRef.current.scrollTop = el.offsetTop - scrollRef.current.offsetTop - 12;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rewindSignal]);
 
   // Sub-agent calls carry a parentId; collect them under their parent `task`
   // call so the parent card can render them nested, and skip them at top level.
@@ -310,18 +295,10 @@ export function Transcript({
 
   // ── JumpBar integration ───────────────────────────────────────────────────
   const jumpToQuestion = (question: QuestionAnchor) => {
-    const el = scrollRef.current;
     const node = document.getElementById(questionAnchorId(question.id));
-    if (!el || !node) return;
+    if (!node) return;
     stick.current = false;
-    if (resizeFrame.current !== null) {
-      cancelAnimationFrame(resizeFrame.current);
-      resizeFrame.current = null;
-    }
-    const scrollerRect = el.getBoundingClientRect();
-    const nodeRect = node.getBoundingClientRect();
-    const top = el.scrollTop + nodeRect.top - scrollerRect.top - 12;
-    el.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
+    smoothScrollTo(node, 12);
   };
 
   const handleJumpToQuestion = useCallback((question: QuestionAnchor) => {
@@ -342,7 +319,7 @@ export function Transcript({
   // (added by upstream PR #3423) instead of per-call renderSegments.
   const empty = items.length === 0;
 
-  // In compact/minimal mode, break each turn into step groups.
+  // In compact mode, break each turn into step groups.
   // A step = one assistant + its tool results, from one assistant to the next.
   // Each completed non-final step is folded into "Processed".
   const stepGroups = useMemo(() => {
@@ -353,7 +330,6 @@ export function Transcript({
     for (let i = hotStartIdx; i < items.length; i++) {
       const it = items[i];
       if (it.kind === "user") {
-        // Close pending group — if it's a non-streaming text assistant it's the final answer
         if (current.length > 0) {
           const first = current[0];
           const isFinal = first.kind === "assistant" && !first.streaming && first.text.trim() !== "";
@@ -365,7 +341,6 @@ export function Transcript({
       }
       if (it.kind === "assistant") {
         if (current.length > 0) {
-          // Previous step is complete — a new assistant has appeared
           groups.push({ items: current, isFinal: false, isComplete: true });
           current = [];
         }
@@ -374,7 +349,6 @@ export function Transcript({
         current.push(it);
       }
     }
-    // Last group in progress
     if (current.length > 0) {
       const first = current[0];
       const isFinal = first.kind === "assistant" && !first.streaming && first.text.trim() !== "";
@@ -412,8 +386,9 @@ export function Transcript({
       actionReady = false;
     };
 
+    // Compact mode: step-based rendering
+    // Standard mode: flat rendering (no step groups)
     if (stepGroups) {
-      // Compact/minimal mode: step-based rendering
       // Collect consecutive completed non-final steps into batches
       let collapseBatch: Item[] = [];
       let collapseBatchStart: string | null = null;
@@ -436,20 +411,19 @@ export function Transcript({
       for (const group of stepGroups) {
         const first = group.items[0];
 
-        // User message
         if (first.kind === "user") {
           flushCollapseBatch();
           pushTurnActions();
           const tn = userTurn.get(first.id);
           activeTurn = tn;
           out.push(
-            <UserMessage key={first.id} text={first.text} failed={first.failed} turn={tn} anchorId={questionAnchorId(first.id)} />,
+            <UserMessage key={first.id} id={first.id} text={first.text} failed={first.failed} turn={tn} anchorId={questionAnchorId(first.id)} />,
           );
           continue;
         }
 
         // Completed non-final step → batch it
-        if (group.isComplete && !group.isFinal && displayMode !== "standard") {
+        if (group.isComplete && !group.isFinal) {
           if (!collapseBatchStart) collapseBatchStart = first.id;
           collapseBatch.push(...group.items);
           continue;
@@ -457,65 +431,77 @@ export function Transcript({
 
         // Final answer or active step → flush any pending batch then render
         flushCollapseBatch();
-        // Group consecutive readOnly tools into a batch
-        const readOnlyBatch: ToolItem[] = [];
-        const flushReadOnlyBatch = () => {
-          if (readOnlyBatch.length === 0) return;
-          out.push(<ReadOnlyBatch key={`rob-${readOnlyBatch[0].id}`} items={readOnlyBatch} subcalls={subcallsByParent} />);
-          readOnlyBatch.length = 0;
-        };
-        for (const it of group.items) {
-          // Running read-only tools render individually (visible in progress);
-          // only completed read-only tools go into the batch (hidden after done)
-          if (it.kind === "tool" && it.readOnly && !it.parentId && it.name !== "todo_write" && it.name !== "exit_plan_mode") {
-            if (it.status === "running") {
-              flushReadOnlyBatch();
-              out.push(<ToolCard key={it.id} item={it} subcalls={subcallsByParent.get(it.id)} />);
-              continue;
+        const nonAssistantItems = group.items.filter(
+          (it) => it.kind !== "assistant" || (it.streaming && !it.text.trim())
+        );
+        const hasRunning = nonAssistantItems.some((it) => it.kind === "tool" && it.status === "running");
+        if (nonAssistantItems.length > 0 && !hasRunning) {
+          const dur = nonAssistantItems.reduce((ms, it) => ms + (it.kind === "tool" ? ((it as ToolItem).durationMs ?? 0) : 0), 0);
+          out.push(
+            <TurnCollapse
+              key={`step-${first.id}`}
+              items={nonAssistantItems}
+              durationMs={dur}
+              mode={displayMode}
+              subcalls={subcallsByParent}
+            />,
+          );
+        } else if (nonAssistantItems.length > 0) {
+          for (const it of nonAssistantItems) {
+            if (it.kind === "tool") {
+              if (it.parentId) continue;
+              if (it.name === "todo_write" || it.name === "exit_plan_mode") continue;
+              out.push(<ToolCard key={it.id} item={it as ToolItem} subcalls={subcallsByParent.get(it.id)} />);
             }
-            readOnlyBatch.push(it as ToolItem);
-            continue;
-          }
-          flushReadOnlyBatch();
-          switch (it.kind) {
-            case "assistant":
-              out.push(<LiveAssistantMessage key={it.id} item={it as AssistantItem} defaultExpanded={defaultExpandThinking} expandWhileStreaming={false} />);
-              if (!it.streaming && it.text.trim() !== "") {
-                actionText = it.text;
-                actionReady = true;
-              }
-              break;
-            case "tool":
-              if (it.parentId) break;
-              if (it.name === "todo_write") break;
-              if (it.name === "exit_plan_mode") break;
-              out.push(<ToolCard key={it.id} item={it} subcalls={subcallsByParent.get(it.id)} />);
-              break;
-            case "phase": out.push(<PhaseCard key={it.id} text={it.text} />); break;
-            case "notice": out.push(<NoticeCard key={it.id} level={it.level} text={it.text} />); break;
-            case "compaction": out.push(<CompactionCard key={it.id} item={it} />); break;
+            if (it.kind === "phase") out.push(<PhaseCard key={it.id} text={it.text} />);
           }
         }
-        flushReadOnlyBatch();
+        // Render the final assistant message (if any) directly
+        for (const it of group.items) {
+          if (it.kind !== "assistant") continue;
+          out.push(<LiveAssistantMessage key={it.id} item={it as AssistantItem} defaultExpanded={false} />);
+          if (!it.streaming && it.text.trim() !== "") {
+            actionText = it.text;
+            actionReady = true;
+          }
+        }
       }
       flushCollapseBatch();
       pushTurnActions();
     } else {
       // Standard mode: flat rendering
+      const roBatch: ToolItem[] = [];
+      const flushRO = () => {
+        if (roBatch.length === 0) return;
+        out.push(<ReadOnlyBatch key={`rob-${roBatch[0].id}`} items={[...roBatch]} subcalls={subcallsByParent} />);
+        roBatch.length = 0;
+      };
       for (let i = hotStartIdx; i < items.length; i++) {
         const it = items[i];
+        if (
+          it.kind === "tool" &&
+          !it.parentId &&
+          it.status !== "running" &&
+          it.name !== "todo_write" &&
+          it.name !== "exit_plan_mode" &&
+          isReadOnlyTool(it.name)
+        ) {
+          roBatch.push(it as ToolItem);
+          continue;
+        }
+        flushRO();
         switch (it.kind) {
           case "user": {
             pushTurnActions();
             const tn = userTurn.get(it.id);
             activeTurn = tn;
             out.push(
-              <UserMessage key={it.id} text={it.text} failed={it.failed} turn={tn} anchorId={questionAnchorId(it.id)} />,
+              <UserMessage key={it.id} id={it.id} text={it.text} failed={it.failed} turn={tn} anchorId={questionAnchorId(it.id)} />,
             );
             break;
           }
           case "assistant":
-            out.push(<LiveAssistantMessage key={it.id} item={it as AssistantItem} defaultExpanded={defaultExpandThinking} />);
+            out.push(<LiveAssistantMessage key={it.id} item={it as AssistantItem} defaultExpanded={false} />);
             if (!it.streaming && it.text.trim() !== "") {
               actionText = it.text;
               actionReady = true;
@@ -532,6 +518,7 @@ export function Transcript({
           case "compaction": out.push(<CompactionCard key={it.id} item={it} />); break;
         }
       }
+      flushRO();
       pushTurnActions();
     }
     return out;
@@ -570,7 +557,6 @@ export function Transcript({
             warmRewindDisabled={rewindDisabled}
             warmOnRewind={onRewind}
             warmSetOpenAction={setOpenAction}
-            defaultExpandThinking={defaultExpandThinking}
             onToggleColdPage={() => setColdPage((p) => p + 1)}
             onToggleWarmTurn={(g, expand) => {
               setExpandedWarmTurns((prev) => {
@@ -581,7 +567,9 @@ export function Transcript({
             }}
           />
         )}
-        {hotZoneNodes}
+        <div ref={entranceRef}>
+          {hotZoneNodes}
+        </div>
       </LiveStreamContext.Provider>
     </div>
   );
@@ -606,7 +594,6 @@ const WarmZone = memo(function WarmZone({
   warmRewindDisabled,
   warmOnRewind,
   warmSetOpenAction,
-  defaultExpandThinking = false,
   onToggleColdPage,
   onToggleWarmTurn,
 }: {
@@ -624,7 +611,6 @@ const WarmZone = memo(function WarmZone({
   warmRewindDisabled: boolean;
   warmOnRewind: ((turn: number, scope: string) => void) | undefined;
   warmSetOpenAction: (action: OpenTurnAction | null) => void;
-  defaultExpandThinking?: boolean;
   onToggleColdPage: () => void;
   onToggleWarmTurn: (g: number, expand: boolean) => void;
 }) {
@@ -679,7 +665,6 @@ const WarmZone = memo(function WarmZone({
               rewindDisabled={warmRewindDisabled}
               onRewind={warmOnRewind}
               setOpenAction={warmSetOpenAction}
-              defaultExpandThinking={defaultExpandThinking}
             />
           </WarmTurnCard>,
         );
@@ -723,7 +708,6 @@ function WarmTurnItems({
   rewindDisabled,
   onRewind,
   setOpenAction,
-  defaultExpandThinking = false,
 }: {
   startIdx: number;
   endIdx: number;
@@ -736,7 +720,6 @@ function WarmTurnItems({
   rewindDisabled: boolean;
   onRewind: ((turn: number, scope: string) => void) | undefined;
   setOpenAction: (action: OpenTurnAction | null) => void;
-  defaultExpandThinking?: boolean;
 }) {
   const nodes: React.ReactNode[] = [];
   let actionText = "";
@@ -770,7 +753,7 @@ function WarmTurnItems({
   const roBatch: ToolItem[] = [];
   const flushRO = () => {
     if (roBatch.length === 0) return;
-    nodes.push(<ReadOnlyBatch key={`rob-${roBatch[0].id}`} items={roBatch} subcalls={subcalls} />);
+    nodes.push(<ReadOnlyBatch key={`rob-${roBatch[0].id}`} items={[...roBatch]} subcalls={subcalls} />);
     roBatch.length = 0;
   };
 
@@ -778,7 +761,7 @@ function WarmTurnItems({
     const it = items[i];
 
     // Completed read-only tools → batch into ReadOnlyBatch
-    if (it.kind === "tool" && it.readOnly && !it.parentId && it.name !== "todo_write" && it.name !== "exit_plan_mode" && it.status !== "running") {
+    if (it.kind === "tool" && !it.parentId && it.name !== "todo_write" && it.name !== "exit_plan_mode" && isReadOnlyTool(it.name)) {
       roBatch.push(it as ToolItem);
       continue;
     }
@@ -795,7 +778,7 @@ function WarmTurnItems({
         break;
       }
       case "assistant": {
-        nodes.push(<AssistantMessage key={it.id} item={it} defaultExpanded={defaultExpandThinking} />);
+        nodes.push(<AssistantMessage key={it.id} item={it} defaultExpanded={false} />);
         if (!it.streaming && it.text.trim() !== "") {
           actionText = it.text;
           actionReady = true;
@@ -837,12 +820,26 @@ function WarmTurnCard({
   children?: React.ReactNode;
 }) {
   const t = useT();
+  const contentRef = useRef<HTMLDivElement>(null);
+  const prevHeightRef = useRef(0);
+  useGSAPCollapse(contentRef, expanded, { prevHeight: prevHeightRef.current });
+  // Always render both children so the container's scrollHeight reflects
+  // the correct content at all times.  The inactive one is display:none.
   return (
     <div className={`warm-turn${expanded ? " warm-turn--expanded" : ""}`}>
       <button
         type="button"
         className="warm-turn__head"
-        onClick={onToggle}
+        onClick={() => {
+          // Capture height before DOM swap so the collapse animation
+          // starts from the correct (expanded) height.
+          const el = contentRef.current;
+          if (el) {
+            el.style.height = "auto";
+            prevHeightRef.current = el.scrollHeight;
+          }
+          onToggle();
+        }}
         aria-expanded={expanded}
       >
         <span className="warm-turn__chevron">
@@ -853,52 +850,17 @@ function WarmTurnCard({
           {toolCount > 0 && <span>{t("transcript.toolCount", { n: toolCount })}</span>}
         </span>
       </button>
-      {expanded ? (
-        <div className="warm-turn__body">{children}</div>
-      ) : (
-        assistantPreview && <div className="warm-turn__assistant">{assistantPreview}</div>
-      )}
+      <div ref={contentRef} className="warm-turn__content">
+        <div className="warm-turn__body" style={{ display: expanded ? undefined : "none" }}>{children}</div>
+        {assistantPreview && (
+          <div className="warm-turn__assistant" style={{ display: expanded ? "none" : undefined }}>{assistantPreview}</div>
+        )}
+      </div>
     </div>
   );
 }
 
-// ── ReadOnlyBatch ─────────────────────────────────────────────────────
-
-type ReadOnlyBatchProps = {
-  items: ToolItem[];
-  subcalls: ReadonlyMap<string, ToolItem[]>;
-};
-
-function ReadOnlyBatch({ items, subcalls }: ReadOnlyBatchProps) {
-  const t = useT();
-  const [open, setOpen] = useState(false);
-
-  const readCount = items.filter((it) => it.name === "read_file" || it.name === "ls").length;
-  const searchCount = items.filter((it) => it.name === "grep" || it.name === "glob" || it.name === "web_fetch").length;
-
-  const parts: string[] = [];
-  if (readCount > 0) parts.push(t("tool.readCount", { n: readCount }));
-  if (searchCount > 0) parts.push(t("tool.searchCount", { n: searchCount }));
-  const label = parts.join(" · ");
-
-  return (
-    <div className={`readonly-batch${open ? " readonly-batch--open" : ""}`}>
-      <button type="button" className="reasoning__head" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
-        <ChevronRight className={`reasoning__chevron${open ? " reasoning__chevron--open" : ""}`} size={12} />
-        <span className="readonly-batch__label">{label}</span>
-      </button>
-      {open && (
-        <div className="readonly-batch__body">
-          {items.map((it) => (
-            <ToolCard key={it.id} item={it} subcalls={subcalls.get(it.id)} />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ── TurnCollapse: compact/minimal mode grouping ──────────────────────────────
+// ── TurnCollapse: compact mode grouping ──────────────────────────────────────
 
 type TurnCollapseProps = {
   items: Item[];       // intermediate items (tools, reasoning, phase)
@@ -910,20 +872,20 @@ type TurnCollapseProps = {
 function TurnCollapse({ items, durationMs, mode, subcalls }: TurnCollapseProps) {
   const t = useT();
   const [open, setOpen] = useState(false);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  useGSAPCollapse(bodyRef, open);
 
   // Keep only items the body will actually render — an expandable fold over
-  // nothing is worse than no fold. Minimal mode strips reasoning, so a
-  // reasoning-only assistant counts as empty there.
+  // nothing is worse than no fold.
   const displayItems = useMemo(() => {
     return items.filter((it) => {
       if (it.kind === "assistant") {
         if (it.text.trim() !== "") return true;
-        return mode !== "minimal" && Boolean(it.reasoning);
+        return Boolean(it.reasoning);
       }
-      if (it.kind === "phase") return mode !== "minimal";
+      if (it.kind === "phase") return true;
       if (it.kind !== "tool") return false;
       if (it.parentId || it.name === "todo_write" || it.name === "exit_plan_mode") return false;
-      if (mode === "minimal") return !it.readOnly && it.name !== "bash";
       return true;
     });
   }, [items, mode]);
@@ -938,11 +900,11 @@ function TurnCollapse({ items, durationMs, mode, subcalls }: TurnCollapseProps) 
   const roBatch: ToolItem[] = [];
   const flushRO = () => {
     if (roBatch.length === 0) return;
-    body.push(<ReadOnlyBatch key={`rob-${roBatch[0].id}`} items={roBatch} subcalls={subcalls} />);
+    body.push(<ReadOnlyBatch key={`rob-${roBatch[0].id}`} items={[...roBatch]} subcalls={subcalls} />);
     roBatch.length = 0;
   };
   for (const it of displayItems) {
-    if (it.kind === "tool" && it.readOnly && !it.parentId && it.name !== "todo_write" && it.name !== "exit_plan_mode" && it.status !== "running") {
+    if (it.kind === "tool" && !it.parentId && it.name !== "todo_write" && it.name !== "exit_plan_mode" && it.status !== "running" && isReadOnlyTool(it.name)) {
       roBatch.push(it as ToolItem);
       continue;
     }
@@ -956,7 +918,7 @@ function TurnCollapse({ items, durationMs, mode, subcalls }: TurnCollapseProps) 
         break;
       case "phase": body.push(<PhaseCard key={it.id} text={it.text} />); break;
       case "assistant": {
-        const displayItem = mode === "minimal" ? { ...it, reasoning: "" } : it;
+        const displayItem = it;
         body.push(<AssistantMessage key={it.id} item={displayItem as AssistantItem} />);
         break;
       }
@@ -965,7 +927,7 @@ function TurnCollapse({ items, durationMs, mode, subcalls }: TurnCollapseProps) 
   flushRO();
 
   return (
-    <div className={`turn-collapse${open ? " turn-collapse--open" : ""}`}>
+    <div className={`turn-collapse${open ? " turn-collapse--open" : ""}`} data-entrance={displayItems[0]?.id || undefined}>
       <button
         type="button"
         className="reasoning__head"
@@ -975,9 +937,7 @@ function TurnCollapse({ items, durationMs, mode, subcalls }: TurnCollapseProps) 
         <ChevronRight className={`reasoning__chevron${open ? " reasoning__chevron--open" : ""}`} size={12} />
         <span className="turn-collapse__label">{label}</span>
       </button>
-      {open && (
-        <div className="turn-collapse__body">{body}</div>
-      )}
+      <div ref={bodyRef} className="turn-collapse__body">{body}</div>
     </div>
   );
 }
@@ -1116,12 +1076,12 @@ type CompactionItem = Extract<Item, { kind: "compaction" }>;
 type NoticeItem = Extract<Item, { kind: "notice" }>;
 
 function PhaseCard({ text }: { text: string }) {
-  return <div className="phase"><ProcessPhaseIcon size={12} /><span>{text}</span></div>;
+  return <div className="phase" data-entrance="true"><ProcessPhaseIcon size={12} /><span>{text}</span></div>;
 }
 
 function NoticeCard({ level, text }: { level: NoticeItem["level"]; text: string }) {
   return (
-    <div className={`notice-line notice-line--${level}`}>
+    <div className={`notice-line notice-line--${level}`} data-entrance="true">
       <span className="notice-line__icon">{level === "warn" ? "⚠ " : "ℹ "}</span>
       <span className="notice-line__text">{text}</span>
     </div>
@@ -1132,10 +1092,10 @@ function CompactionCard({ item }: { item: CompactionItem }) {
   const t = useT();
   const [open, setOpen] = useState(false);
   if (item.pending) {
-    return <div className="compaction compaction--pending"><ProcessCompactIcon size={12} /><span>{t("compaction.working")}</span></div>;
+    return <div className="compaction compaction--pending" data-entrance={item.id}><ProcessCompactIcon size={12} /><span>{t("compaction.working")}</span></div>;
   }
   return (
-    <div className="compaction">
+    <div className="compaction" data-entrance={item.id}>
       <button type="button" className="compaction__head" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
         <ProcessCompactIcon size={12} />
         <span>{t("compaction.title")}</span>

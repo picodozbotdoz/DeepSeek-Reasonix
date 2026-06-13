@@ -12,6 +12,7 @@
 ## Contents
 
 - [Configuration](#configuration)
+- [Reasoning language](./REASONING_LANGUAGE.md)
 - [Mode shortcuts quick map](#mode-shortcuts-quick-map)
 - [Permissions & sandbox](#permissions--sandbox)
 - [Plugins (MCP)](#plugins-mcp)
@@ -21,9 +22,14 @@
 
 ## Configuration
 
-Resolution order: **flag > `./reasonix.toml` > `~/.config/reasonix/config.toml` >
-built-in defaults**. Secrets come from the environment via `api_key_env` and are
+Resolution order: **flag > `./reasonix.toml` > the user config file >
+built-in defaults**. The user config lives in your OS config dir: `~/.config/reasonix/`
+on Linux, `~/Library/Application Support/reasonix/` on macOS, `%AppData%\reasonix\` on
+Windows. Secrets come from the environment via `api_key_env` and are
 never stored in config files.
+
+For the desktop and CLI usage of visible reasoning language, see
+[Reasoning language](./REASONING_LANGUAGE.md).
 
 ```toml
 default_model = "deepseek-flash"   # executor; set [agent].planner_model to add a planner
@@ -35,6 +41,7 @@ default_model = "deepseek-flash"   # executor; set [agent].planner_model to add 
 [agent]
 max_steps = 0                    # executor tool-call rounds; 0 = no limit
 planner_max_steps = 12           # planner read-only tool-call rounds; 0 = no limit
+reasoning_language = "auto"      # visible reasoning text: auto|zh|en
 # planner_model = "mimo-pro"          # optional low-frequency planner
 # subagent_model = "deepseek-pro"     # optional default for runAs=subagent skills
 # subagent_models = { review = "deepseek-pro", security_review = "deepseek-pro" }
@@ -195,7 +202,8 @@ convenient.
 
 In `reasonix chat`, built-in commands (`/compact`, `/new`, `/clear`, `/rewind`,
 `/tree`, `/branch`, `/switch`, `/todo`, `/model`, `/mcp`, `/skills`, `/hooks`,
-`/memory`, `/output-style`, `/sandbox`, `/language`, `/auto-plan`, `/help`) run
+`/memory`, `/output-style`, `/sandbox`, `/language`, `/auto-plan`,
+`/reasoning-language`, `/help`) run
 locally — `/help` lists them all. `/new` starts a new session while saving the
 previous transcript for history/resume; `/clear` asks for confirmation, then
 discards the current context without saving it. `/tree` shows saved conversation
@@ -205,6 +213,20 @@ another branch. **Custom commands** are Markdown files under `.reasonix/commands
 (project) or `~/.config/reasonix/commands/` (user) — `review.md` becomes
 `/review`, a subdirectory namespaces it (`git/commit.md` → `/git:commit`). The
 body is a prompt template; invoking the command sends it as a turn.
+
+`/memory` lists both memory documents (`REASONIX.md` / `AGENTS.md`) and saved
+auto-memory facts. During agent turns, the read-only `history` and `memory`
+tools let the model retrieve prior session decisions, compacted-history
+archives, and saved facts on demand instead of injecting that dynamic state into
+the stable system prompt. `/forget <name>` archives a saved fact rather than
+deleting it permanently; the CLI/TUI and desktop memory panel can show those
+archived files for traceability, but they are not searched as active memory.
+Agent-initiated `remember` and `forget` calls always ask for fresh approval and
+show a compact preview of the saved or archived memory before they run.
+Retrieval keeps the top BM25 result while trimming weak common-word matches, and
+0-result responses suggest narrower, more distinctive follow-up searches.
+For implementation details, see
+[`SESSION_MEMORY_RETRIEVAL.md`](SESSION_MEMORY_RETRIEVAL.md).
 
 ```markdown
 ---
@@ -261,8 +283,11 @@ before editing or running side-effecting commands. `auto_plan_classifier` can
 name a cheap provider such as `deepseek-flash`; it is only called for borderline
 inputs and falls back to the heuristic if classification fails. Use
 `/auto-plan off|on` in `reasonix chat` to change the user-level setting, or
-`reasonix config auto-plan off|on` from a shell/script. Pass `--local` to the
-shell command only when you intentionally want a project-local override.
+`reasonix config auto-plan off|on` from a shell/script. The visible reasoning
+language uses the same shape: `/reasoning-language auto|zh|en` in chat, or
+`reasonix config reasoning-language auto|zh|en` in a shell/script. Pass
+`--local` to the shell command only when you intentionally want a project-local
+override.
 
 The why behind separate sessions (keeping each model's prefix cache-stable) is in
 [`SPEC.md` §3.5](./SPEC.md#35-two-model-collaboration-coordinator).
