@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -537,6 +538,77 @@ func TestRunServerGroupsSameNamedServerSerial(t *testing.T) {
 
 // TestRunServerGroupsPreservesOutputOrder verifies that even with cross-server
 // parallelism, results still come back in call order.
+// TestRunServerGroupsCapUnderLimit executes 3 groups (under the cap of 8) and
+// verifies they all complete correctly.
+func TestRunServerGroupsCapUnderLimit(t *testing.T) {
+	const delay = 30 * time.Millisecond
+
+	callsDispatched := int32(0)
+	run := func(i int) {
+		atomic.AddInt32(&callsDispatched, 1)
+		<-time.After(delay)
+	}
+
+	groups := []serverGroup{
+		{server: "s1", batches: []toolCallBatch{{start: 0, end: 1}}},
+		{server: "s2", batches: []toolCallBatch{{start: 1, end: 2}}},
+		{server: "s3", batches: []toolCallBatch{{start: 2, end: 3}}},
+	}
+
+	start := time.Now()
+	runServerGroups(groups, run)
+	elapsed := time.Since(start)
+
+	if callsDispatched != 3 {
+		t.Errorf("dispatched %d calls, want 3", callsDispatched)
+	}
+	// Parallel (3 under cap of 8): ~30ms + overhead; serial: ~90ms.
+	if elapsed >= 3*delay {
+		t.Errorf("3 server groups took %v (>= %v) — not parallel", elapsed, 3*delay)
+	}
+}
+
+// TestRunServerGroupsCapPreventsOverflow verifies that with 12 different server
+// groups (over the cap of 8), at most 8 run concurrently. We measure this by
+// tracking the peak concurrent count.
+func TestRunServerGroupsCapPreventsOverflow(t *testing.T) {
+	const delay = 50 * time.Millisecond
+
+	var mu sync.Mutex
+	var concurrent, peak int32
+	run := func(i int) {
+		mu.Lock()
+		concurrent++
+		if concurrent > peak {
+			peak = concurrent
+		}
+		mu.Unlock()
+
+		<-time.After(delay)
+
+		mu.Lock()
+		concurrent--
+		mu.Unlock()
+	}
+
+	groups := make([]serverGroup, 12)
+	for i := range groups {
+		groups[i] = serverGroup{
+			server:   fmt.Sprintf("s%d", i),
+			batches:  []toolCallBatch{{start: i, end: i + 1}},
+		}
+	}
+
+	runServerGroups(groups, run)
+
+	if peak > maxParallel {
+		t.Errorf("peak concurrency was %d, want ≤ %d", peak, maxParallel)
+	}
+	if peak < 2 {
+		t.Errorf("peak concurrency was only %d — groups appear to have run serially", peak)
+	}
+}
+
 func TestRunServerGroupsPreservesOutputOrder(t *testing.T) {
 	// Each call records its index in a shared slice. The first call (server A)
 	// sleeps 100ms; the second (server B) sleeps 10ms. With parallelism the

@@ -31,6 +31,7 @@ const maxToolOutputBytes = 32 * 1024
 const maxFinalReadinessBlocks = 3
 const maxEmptyFinalBlocks = 3
 const maxStreamRecoveries = 1
+const maxParallel = 8 // max concurrent goroutines within a single batch or across server groups
 
 // Renderer redraws the assistant's final-answer text as styled output. It is
 // applied only after a turn's text stream completes, so the user sees raw
@@ -846,7 +847,6 @@ func parallelisable(r *tool.Registry, name string) bool {
 }
 
 func runParallel(start, end int, run func(int)) {
-	const maxParallel = 8
 	sem := make(chan struct{}, maxParallel)
 	var wg sync.WaitGroup
 	for i := start; i < end; i++ {
@@ -941,13 +941,17 @@ func runServerGroups(groups []serverGroup, run func(int)) {
 		return
 	}
 	// Distinct MCP servers: groups use separate connections, so they can run
-	// in parallel without ordering conflicts.
+	// in parallel without ordering conflicts. Cap concurrency to maxParallel
+	// so a large batch of server calls doesn't spike goroutines.
+	sem := make(chan struct{}, maxParallel)
 	var wg sync.WaitGroup
 	for _, g := range groups {
 		g := g
+		sem <- struct{}{}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer func() { <-sem }()
 			runGroup(g, run)
 		}()
 	}

@@ -17,6 +17,44 @@
 //
 // Then the manager can call mcp__learner__delegate_task(task="...") to delegate
 // work to the learner.
+//
+// # Scaling to many workers
+//
+// Each bridge process serves MCP `tools/call` synchronously — it handles one
+// `delegate_task` at a time. Pooling ACP subprocesses inside one bridge (via
+// -pool-max-total) only reuses a warm process for the *next* call; it does NOT
+// make concurrent calls within the same bridge. To delegate to multiple workers
+// simultaneously, declare one [[plugins]] entry per worker:
+//
+//	[[plugins]]
+//	name    = "learner-01"
+//	command = "reasonix-plugin-acp-bridge"
+//	args    = ["-learner-dir", "../workers/learner-01", "-pool-max-total", "1"]
+//
+//	[[plugins]]
+//	name    = "learner-02"
+//	command = "reasonix-plugin-acp-bridge"
+//	args    = ["-learner-dir", "../workers/learner-02", "-pool-max-total", "1"]
+//
+//	[[plugins]]
+//	name    = "coder-01"
+//	command = "reasonix-plugin-acp-bridge"
+//	args    = ["-learner-dir", "../workers/coder-01", "-pool-max-total", "1"]
+//
+// Each bridge is its own OS process with its own stdio MCP connection.
+// The manager agent's cross-server parallel dispatch treats
+// mcp__learner-01__*, mcp__learner-02__*, and mcp__coder-01__* as distinct
+// servers and runs calls to them concurrently (capped at 8 by default).
+//
+// Memory overhead: each bridge process (~10 MB RSS) plus one `reasonix acp`
+// subprocess (~20-50 MB RSS when active). With 50 workers you can expect
+// ~500 MB-3 GB of peak RSS. Use -pool-max-total 1 (the default) so each
+// bridge spawns its ACP subprocess on demand and reuses it, keeping the active
+// count bounded by the number of concurrent delegations.
+//
+// The -mono-task flag spawns a fresh `reasonix acp` per call and kills it on
+// completion, avoiding the pool entirely. This is useful when ACP processes
+// accumulate state that must be isolated between calls.
 package main
 
 import (
@@ -33,6 +71,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/BurntSushi/toml"
 )
 
 var version = "dev"
@@ -71,7 +111,12 @@ func main() {
 	}
 	log.Printf("learner dir: %s, monoTaskACP: %v, pool: idle=%d total=%d", absDir, monoTaskACP, poolMaxIdle, poolMaxTotal)
 
-	if err := serve(os.Stdin, os.Stdout, absDir, monoTaskACP, poolMaxIdle, poolMaxTotal); err != nil {
+	wc := loadWorkerConfig(absDir)
+	if wc.Description != "" {
+		log.Printf("worker description: %q", wc.Description)
+	}
+
+	if err := serve(os.Stdin, os.Stdout, absDir, monoTaskACP, poolMaxIdle, poolMaxTotal, wc.Description); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -106,7 +151,7 @@ const (
 
 // ─── MCP server loop ────────────────────────────────────────────────────
 
-func serve(in *os.File, out *os.File, learnerDir string, monoTaskACP bool, maxIdle, maxTotal int) error {
+func serve(in *os.File, out *os.File, learnerDir string, monoTaskACP bool, maxIdle, maxTotal int, descOverride string) error {
 	r := bufio.NewReader(in)
 	w := bufio.NewWriter(out)
 	defer w.Flush()
@@ -117,7 +162,7 @@ func serve(in *os.File, out *os.File, learnerDir string, monoTaskACP bool, maxId
 		defer pool.drain()
 	}
 
-	bridge := &acpBridge{learnerDir: learnerDir, pool: pool, monoTaskACP: monoTaskACP}
+	bridge := &acpBridge{learnerDir: learnerDir, pool: pool, monoTaskACP: monoTaskACP, descOverride: descOverride}
 
 	for {
 		line, err := r.ReadBytes('\n')
@@ -135,10 +180,36 @@ func serve(in *os.File, out *os.File, learnerDir string, monoTaskACP bool, maxId
 	}
 }
 
+// workerConfig is an optional per-worker descriptor loaded from
+// <learnerDir>/worker.toml. When present, its fields tailor the bridge's
+// tool definitions so the manager agent can distinguish workers by role.
+type workerConfig struct {
+	// Description overrides the generic delegate_task description. Use it to
+	// tell the manager what this worker specialises in.
+	Description string `toml:"description"`
+}
+
+// loadWorkerConfig reads worker.toml from dir. A missing or empty file returns
+// a zero config without error (the bridge uses its defaults).
+func loadWorkerConfig(dir string) workerConfig {
+	var cfg workerConfig
+	path := filepath.Join(dir, "worker.toml")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return cfg // missing → defaults
+	}
+	if err := toml.Unmarshal(b, &cfg); err != nil {
+		log.Printf("worker.toml: parse error: %v (using defaults)", err)
+		return cfg
+	}
+	return cfg
+}
+
 type acpBridge struct {
-	learnerDir  string
-	pool        *acpPool
-	monoTaskACP bool
+	learnerDir   string
+	pool         *acpPool
+	monoTaskACP  bool
+	descOverride string // from worker.toml, overrides delegate_task description
 }
 
 // ─── ACP process pool ───────────────────────────────────────────────────
@@ -303,7 +374,7 @@ func (b *acpBridge) handleLine(line []byte, w *bufio.Writer) error {
 			"serverInfo":      map[string]any{"name": "reasonix-plugin-acp-bridge", "version": version},
 		}
 	case "tools/list":
-		resp.Result = map[string]any{"tools": toolList()}
+		resp.Result = map[string]any{"tools": b.toolList()}
 	case "tools/call":
 		resp.Result, resp.Error = b.callTool(req.Params)
 	default:
@@ -322,11 +393,15 @@ func (b *acpBridge) handleLine(line []byte, w *bufio.Writer) error {
 
 // ─── Tool definitions ───────────────────────────────────────────────────
 
-func toolList() []map[string]any {
+func (b *acpBridge) toolList() []map[string]any {
+	description := "Delegate a task to the learner Reasonix agent. The learner runs autonomously in its own workspace, thinks through the problem, calls tools (read_file, bash, edit_file, etc.), and returns the result. Use this when a task belongs to the learner's workspace or you want a focused sub-agent to handle it."
+	if b.descOverride != "" {
+		description = b.descOverride
+	}
 	return []map[string]any{
 		{
 			"name":        "delegate_task",
-			"description": "Delegate a task to the learner Reasonix agent. The learner runs autonomously in its own workspace, thinks through the problem, calls tools (read_file, bash, edit_file, etc.), and returns the result. Use this when a task belongs to the learner's workspace or you want a focused sub-agent to handle it.",
+			"description": description,
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
