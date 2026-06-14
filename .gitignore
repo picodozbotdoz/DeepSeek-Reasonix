@@ -58,3 +58,5 @@ Thumbs.db
 
 benchmarks/context-maintenance-e2e/run/
 bak/
+*.swp
+*.swo
