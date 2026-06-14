@@ -123,6 +123,7 @@ type Config struct {
 	LSP           LSPConfig           `toml:"lsp"`
 	Bot           BotConfig           `toml:"bot"`
 	CAHooks       CAHooksConfig       `toml:"cahooks"`
+	Clarify       ClarifyConfig       `toml:"clarify"`
 }
 
 // UIConfig controls CLI presentation-only settings. Desktop appearance is kept in
@@ -363,9 +364,14 @@ func (c *Config) ColdResumePruneEnabled() bool {
 }
 
 // ClarifyModel returns the configured clarify model ref, or "" for default.
+// Prefers the top-level [clarify] section's model over the legacy
+// [agent] clarify_model field.
 func (c *Config) ClarifyModel() string {
 	if c == nil {
 		return ""
+	}
+	if m := strings.TrimSpace(c.Clarify.Model); m != "" {
+		return m
 	}
 	return strings.TrimSpace(c.Agent.ClarifyModel)
 }
@@ -467,6 +473,38 @@ func (c CodegraphConfig) ShouldAutoStart() bool {
 
 func (c CodegraphConfig) ResolvedTier() string {
 	return "background"
+}
+
+// ClarifyConfig controls the prompt refinement feature (Clarify). It has two
+// sub-modes: Fresh (prefix-stable, optionally with fixed-size history) and
+// Context (full session-aware, no prefix cache). Each sub-mode has its own
+// system prompt and instruction; empty values fall back to built-in defaults.
+type ClarifyConfig struct {
+	// Model optionally names a provider/model for clarification. Empty = use
+	// the active session's model.
+	Model   string            `toml:"model"`
+	Fresh   ClarifyFreshMode  `toml:"fresh"`
+	Context ClarifyContextMode `toml:"context"`
+}
+
+// ClarifyFreshMode is the prefix-stable clarification mode. The request uses a
+// fresh provider.Request with a stable prefix (system prompt + instruction +
+// fixed-size history) followed by the user's draft. max_history_pairs controls
+// how many conversation pairs are included; 0 means no history (full cache hits).
+type ClarifyFreshMode struct {
+	Enabled         bool   `toml:"enabled"`
+	SystemPrompt    string `toml:"system_prompt"`
+	Instruction     string `toml:"instruction"`
+	MaxHistoryPairs int    `toml:"max_history_pairs"`
+}
+
+// ClarifyContextMode is the session-aware clarification mode. The request sends
+// the full session messages (tools results omitted) plus the user's draft. No
+// prefix caching, but full conversation context.
+type ClarifyContextMode struct {
+	Enabled      bool   `toml:"enabled"`
+	SystemPrompt string `toml:"system_prompt"`
+	Instruction  string `toml:"instruction"`
 }
 
 // BuiltInMCPConfig controls Reasonix-shipped MCP servers that require no user

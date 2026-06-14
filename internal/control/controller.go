@@ -176,6 +176,7 @@ type Controller struct {
 	displayRecorder func(content, display string)
 
 	clarifyProv provider.Provider // optional lightweight provider for prompt refinement
+	clarifyCfg  config.ClarifyConfig
 }
 
 type approvalReply struct {
@@ -280,6 +281,8 @@ type Options struct {
 	// (Ctrl+K / /clarify). When nil, refinement falls back to the session's
 	// executor provider.
 	ClarifyProvider provider.Provider
+	// ClarifyConfig holds the [clarify] config section for both refinement modes.
+	ClarifyConfig config.ClarifyConfig
 }
 
 // New builds a Controller. A nil Sink is replaced with event.Discard.
@@ -332,6 +335,7 @@ func New(opts Options) *Controller {
 		asks:                   map[string]pendingAsk{},
 		granted:                map[string]bool{},
 		clarifyProv:            opts.ClarifyProvider,
+		clarifyCfg:             opts.ClarifyConfig,
 	}
 	// Checkpoints: bind a store to the session and route writer pre-edits into it.
 	c.rebindCheckpoints(opts.SessionPath)
@@ -2659,10 +2663,9 @@ func (c *Controller) ForgetMemory(name string) error {
 	return nil
 }
 
-// ClarifyPrompt refines the user's input text via a lightweight LLM call,
-// returning the original as the first option plus 2–3 refined versions.
-// Boot always wires a ClarifyProvider, so the provider should never be nil
-// in practice. The passthrough fallback is a defensive last resort.
+// ClarifyPrompt refines the user's input text via a fresh, prefix-stable LLM
+// call (mode 2). Uses ClarifyConfig.Fresh settings for system prompt,
+// instruction, and history depth.
 func (c *Controller) ClarifyPrompt(ctx context.Context, input string) ([]string, error) {
 	if strings.TrimSpace(input) == "" {
 		return nil, fmt.Errorf("nothing to clarify")
@@ -2670,7 +2673,40 @@ func (c *Controller) ClarifyPrompt(ctx context.Context, input string) ([]string,
 	if c.clarifyProv == nil {
 		return []string{input}, nil
 	}
-	return clarify.Refine(ctx, c.clarifyProv, input, "")
+
+	sysPrompt := c.clarifyCfg.Fresh.SystemPrompt
+	instruction := c.clarifyCfg.Fresh.Instruction
+	maxPairs := c.clarifyCfg.Fresh.MaxHistoryPairs
+
+	// Collect conversation history from the session if maxPairs > 0.
+	var history []provider.Message
+	if maxPairs > 0 && c.executor != nil {
+		history = c.executor.Session().Snapshot()
+	}
+
+	return clarify.RefineFresh(ctx, c.clarifyProv, input, history, "", sysPrompt, instruction, maxPairs)
+}
+
+// ClarifyPromptContext refines the user's input text by sending full session
+// context (mode 1). Uses ClarifyConfig.Context settings.
+func (c *Controller) ClarifyPromptContext(ctx context.Context, input string) ([]string, error) {
+	if strings.TrimSpace(input) == "" {
+		return nil, fmt.Errorf("nothing to clarify")
+	}
+	if c.clarifyProv == nil {
+		return []string{input}, nil
+	}
+
+	sysPrompt := c.clarifyCfg.Context.SystemPrompt
+	instruction := c.clarifyCfg.Context.Instruction
+
+	// Collect the full session history for context-aware refinement.
+	var sessionMsgs []provider.Message
+	if c.executor != nil {
+		sessionMsgs = c.executor.Session().Snapshot()
+	}
+
+	return clarify.RefineContextual(ctx, c.clarifyProv, input, sessionMsgs, "", sysPrompt, instruction)
 }
 
 // QueueMemory implements memory.Queue: when the model runs the remember/forget

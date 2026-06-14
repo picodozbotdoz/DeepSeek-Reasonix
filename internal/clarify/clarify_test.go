@@ -2,6 +2,7 @@ package clarify
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -210,4 +211,192 @@ func (s *streamProvider) Name() string { return "test" }
 
 func (s *streamProvider) Stream(_ context.Context, _ provider.Request) (<-chan provider.Chunk, error) {
 	return s.ch, nil
+}
+
+func TestRefineFresh(t *testing.T) {
+	t.Run("basic no history", func(t *testing.T) {
+		prov := &mockProvider{text: "VERSION: First\nVERSION: Second"}
+		results, err := RefineFresh(context.Background(), prov, "my draft", nil, "", "", "", 0)
+		if err != nil {
+			t.Fatalf("RefineFresh error: %v", err)
+		}
+		if len(results) != 3 {
+			t.Fatalf("expected 3 results, got %d", len(results))
+		}
+		if results[0] != "my draft" {
+			t.Errorf("results[0] = %q, want %q", results[0], "my draft")
+		}
+	})
+
+	t.Run("with custom system prompt", func(t *testing.T) {
+		prov := &mockProvider{text: "VERSION: A"}
+		results, err := RefineFresh(context.Background(), prov, "test", nil, "", "Custom sys prompt", "", 0)
+		if err != nil {
+			t.Fatalf("RefineFresh error: %v", err)
+		}
+		if len(results) != 2 {
+			t.Fatalf("expected 2 results, got %d", len(results))
+		}
+	})
+
+	t.Run("with history", func(t *testing.T) {
+		prov := &mockProvider{text: "VERSION: Refined"}
+		history := []provider.Message{
+			{Role: provider.RoleUser, Content: "first question"},
+			{Role: provider.RoleAssistant, Content: "first answer"},
+		}
+		results, err := RefineFresh(context.Background(), prov, "new draft", history, "", "", "", 1)
+		if err != nil {
+			t.Fatalf("RefineFresh with history error: %v", err)
+		}
+		if len(results) != 2 {
+			t.Fatalf("expected 2 results, got %d", len(results))
+		}
+	})
+
+	t.Run("focus hint after draft", func(t *testing.T) {
+		prov := &mockProvider{text: "VERSION: Focused"}
+		results, err := RefineFresh(context.Background(), prov, "my draft", nil, "be more specific", "", "", 0)
+		if err != nil {
+			t.Fatalf("RefineFresh with focus hint error: %v", err)
+		}
+		if len(results) != 2 {
+			t.Fatalf("expected 2 results, got %d", len(results))
+		}
+	})
+
+	t.Run("empty input fails", func(t *testing.T) {
+		_, err := RefineFresh(context.Background(), &mockProvider{}, "", nil, "", "", "", 0)
+		if err == nil {
+			t.Fatal("expected error for empty input")
+		}
+	})
+}
+
+func TestRefineContextual(t *testing.T) {
+	t.Run("with session messages", func(t *testing.T) {
+		prov := &mockProvider{text: "VERSION: Contextual refinement"}
+		session := []provider.Message{
+			{Role: provider.RoleUser, Content: "help me debug"},
+			{Role: provider.RoleAssistant, Content: "sure, show me the code"},
+			{Role: provider.RoleUser, Content: "here it is: func main() {}"},
+			{Role: provider.RoleAssistant, Content: "I see the issue"},
+		}
+		results, err := RefineContextual(context.Background(), prov, "fix the bug", session, "", "", "")
+		if err != nil {
+			t.Fatalf("RefineContextual error: %v", err)
+		}
+		if len(results) != 2 {
+			t.Fatalf("expected 2 results, got %d", len(results))
+		}
+		if results[0] != "fix the bug" {
+			t.Errorf("results[0] = %q, want %q", results[0], "fix the bug")
+		}
+	})
+
+	t.Run("tool messages filtered", func(t *testing.T) {
+		prov := &mockProvider{text: "VERSION: Clean"}
+		session := []provider.Message{
+			{Role: provider.RoleUser, Content: "hello"},
+			{Role: provider.RoleAssistant, Content: "hi"},
+			{Role: provider.RoleTool, Content: "some tool output"},
+		}
+		results, err := RefineContextual(context.Background(), prov, "test", session, "", "", "")
+		if err != nil {
+			t.Fatalf("RefineContextual error: %v", err)
+		}
+		if len(results) != 2 {
+			t.Fatalf("expected 2 results, got %d", len(results))
+		}
+	})
+
+	t.Run("empty input fails", func(t *testing.T) {
+		_, err := RefineContextual(context.Background(), &mockProvider{}, "", nil, "", "", "")
+		if err == nil {
+			t.Fatal("expected error for empty input")
+		}
+	})
+
+	t.Run("with custom system prompt and instruction", func(t *testing.T) {
+		prov := &mockProvider{text: "VERSION: Custom"}
+		session := []provider.Message{
+			{Role: provider.RoleUser, Content: "earlier message"},
+			{Role: provider.RoleAssistant, Content: "earlier response"},
+		}
+		results, err := RefineContextual(context.Background(), prov, "final draft", session, "", "Custom sys", "Use the context")
+		if err != nil {
+			t.Fatalf("RefineContextual error: %v", err)
+		}
+		if len(results) != 2 {
+			t.Fatalf("expected 2 results, got %d", len(results))
+		}
+	})
+}
+
+func TestFormatHistory(t *testing.T) {
+	t.Run("zero pairs returns empty", func(t *testing.T) {
+		msgs := []provider.Message{
+			{Role: provider.RoleUser, Content: "hi"},
+			{Role: provider.RoleAssistant, Content: "hello"},
+		}
+		if got := formatHistory(msgs, 0); got != "" {
+			t.Fatalf("expected empty, got %q", got)
+		}
+	})
+
+	t.Run("single pair", func(t *testing.T) {
+		msgs := []provider.Message{
+			{Role: provider.RoleUser, Content: "user msg"},
+			{Role: provider.RoleAssistant, Content: "assistant reply"},
+		}
+		got := formatHistory(msgs, 1)
+		if !strings.Contains(got, "user: user msg") {
+			t.Fatalf("missing user message in:\n%s", got)
+		}
+		if !strings.Contains(got, "assistant: assistant reply") {
+			t.Fatalf("missing assistant message in:\n%s", got)
+		}
+	})
+
+	t.Run("caps at maxPairs", func(t *testing.T) {
+		msgs := []provider.Message{
+			{Role: provider.RoleUser, Content: "first"},
+			{Role: provider.RoleAssistant, Content: "reply1"},
+			{Role: provider.RoleUser, Content: "second"},
+			{Role: provider.RoleAssistant, Content: "reply2"},
+			{Role: provider.RoleUser, Content: "third"},
+			{Role: provider.RoleAssistant, Content: "reply3"},
+		}
+		got := formatHistory(msgs, 2)
+		if strings.Contains(got, "first") {
+			t.Fatalf("should not contain oldest pair:\n%s", got)
+		}
+		if !strings.Contains(got, "second") || !strings.Contains(got, "third") {
+			t.Fatalf("should contain most recent pairs:\n%s", got)
+		}
+	})
+
+	t.Run("skips tool messages", func(t *testing.T) {
+		msgs := []provider.Message{
+			{Role: provider.RoleUser, Content: "user"},
+			{Role: provider.RoleTool, Content: "tool output"},
+			{Role: provider.RoleAssistant, Content: "assistant"},
+		}
+		got := formatHistory(msgs, 1)
+		if !strings.Contains(got, "user: user") {
+			t.Fatalf("missing user message:\n%s", got)
+		}
+		if !strings.Contains(got, "assistant: assistant") {
+			t.Fatalf("missing assistant message:\n%s", got)
+		}
+		if strings.Contains(got, "tool output") {
+			t.Fatal("should not contain tool output")
+		}
+	})
+
+	t.Run("empty messages", func(t *testing.T) {
+		if got := formatHistory(nil, 5); got != "" {
+			t.Fatalf("expected empty, got %q", got)
+		}
+	})
 }

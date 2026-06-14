@@ -946,6 +946,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			return rememberPermissionRule(root, rule)
 		},
 		ClarifyProvider: clarifyProv,
+		ClarifyConfig:   cfg.Clarify,
 	}
 	if classifier != nil {
 		ctrlOpts.Classifier = classifier

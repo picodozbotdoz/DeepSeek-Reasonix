@@ -1,13 +1,28 @@
 # Prompt Refinement (Clarify)
 
 The **Clarify** feature lets you refine your draft prompts with AI assistance before
-submitting them as a normal turn. Instead of sending raw text to the agent, you can
-ask the model to produce 2–3 improved versions, pick the one you like, and then
-submit it — optionally editing further before sending.
+submitting them as a normal turn. It has two modes:
+
+- **Mode 2 (Fresh)** — prefix-stable request, optionally includes recent conversation
+  history. Fast and cache-efficient. Activated via `Ctrl+K` or `/clarify`.
+- **Mode 1 (Context)** — sends full session context so the model sees the entire
+  conversation. No prefix caching, but richer refinements. Activated via
+  `Ctrl+Shift+K` (or `Cmd+K` on Mac) or `/clarify --context`.
+
+## Quick Reference
+
+| Trigger | Mode | Use case |
+|---------|------|----------|
+| `Ctrl+K` | Fresh | Quick refine of your draft, best cache efficiency |
+| `Ctrl+Shift+K` / `Cmd+K` | Context | Refine with full conversation context |
+| `/clarify <text>` | Fresh | Inline refine, standalone text |
+| `/clarify --context <text>` | Context | Inline refine with session context |
+| `reasonix run --clarify` | Fresh | Non-interactive refine |
+| `reasonix run --clarify-context` | Context | Non-interactive refine with session |
 
 ## How to Use
 
-### Ctrl+K (Primary Trigger)
+### Ctrl+K (Fresh Mode — Default)
 
 Type a prompt in the chat input and press **Ctrl+K**:
 
@@ -46,18 +61,19 @@ prompt plus 2–3 refined versions:
 After selecting, the chosen text replaces the input box. You can edit it further
 before pressing **Enter** to submit it as a normal turn.
 
-### /clarify Command
+### Ctrl+Shift+K (Context Mode)
 
-You can also refine text inline with the `/clarify` slash command:
+Same as Ctrl+K, but the model sees the full conversation history for context-aware
+refinements. Use this when your draft references earlier discussion in the session.
+
+### /clarify Command
 
 ```
 /clarify Write a function to parse CSV files with error handling
+/clarify --context Refine the approach we discussed above
 ```
 
-This refines the text after `/clarify` and shows the same picker overlay.
-The text is used directly as the draft — without needing anything in the input box.
-
-> **Note:** `/clarify` without text shows a usage hint.
+`/clarify` without `--context` uses fresh mode; with `--context` uses context mode.
 
 ### When to Use Clarify
 
@@ -71,85 +87,89 @@ The text is used directly as the draft — without needing anything in the input
 
 ## How It Works
 
-### Architecture
+### Architecture (Mode 2 — Fresh)
 
 ```
-User types prompt → Ctrl+K triggers clarify
+User types prompt → Ctrl+K triggers clarify (mode 2)
                          │
                          ▼
               TUI calls Controller.ClarifyPrompt()
                          │
                          ▼
-              clarify.Refine() builds a provider.Request
-              with Tools: nil — no tool schemas, no tool calls
+              clarify.RefineFresh() builds a fresh provider.Request:
+              [system prompt] + [instruction] + [history(N pairs)]
+              + [Draft:\n + input]
+              with Tools: nil
                          │
                          ▼
               Provider.Stream() — lightweight text generation
-              System: "You are a prompt refinement assistant…"
-              User:   "Draft: <user's original prompt>"
                          │
                          ▼
               Response parsed for VERSION:-prefixed lines
               Fallback: full response as one suggestion
                          │
                          ▼
-              Original + 2–3 refinements returned to TUI
+              Original + 2–3 refinements returned → picker → submit
+```
+
+### Cache Boundary (Mode 2 — Fresh)
+
+The fresh mode is designed for **DeepSeek prefix caching**:
+
+```
+[system prompt]      — fixed, cached across ALL clarify calls
+[instruction]        — fixed, cached ("" when none configured)
+[history(N pairs)]   — variable content but fixed size; 
+                       N=0 means no history → full cache hits
+[Draft:\n + input]   — "Draft:\n" prefix cached; user input varies
+```
+
+When `max_history_pairs = 0` (the default), every clarify call hits cache on the
+entire prefix except the final user input. With `max_history_pairs > 0`, the
+history content changes each turn but the system prompt + instruction prefix
+stays cached.
+
+### Architecture (Mode 1 — Context)
+
+```
+Ctrl+Shift+K triggers context mode
                          │
                          ▼
-              Picker overlay → user selects → input replaced
+              Controller.ClarifyPromptContext()
+              reads full session messages from executor
                          │
                          ▼
-              User presses Enter → normal turn via
-              Controller.Submit(selected)
+              clarify.RefineContextual() builds a request with:
+              [system prompt] + [instruction] + [session messages]
+              + [Draft:\n + input]
+              with Tools: nil
+                         │
+                         ▼
+              No prefix cache — session messages change each turn
+              But refinements are aware of the full conversation
 ```
 
 ### Key Design Points
 
-- **No tool calls**: The refinement request passes `Tools: nil`, producing pure
-  text generation. The model cannot call bash, edit files, or do any complex
-  processing — it only generates text. This keeps the refinement fast and cheap.
-- **Original always preserved**: The first option in the picker is always the
-  unmodified original text.
-- **Output format**: The model is instructed to produce `VERSION:`-prefixed
-  lines. The parser extracts 2–3 versions. If no `VERSION:` lines are found
-  (e.g., the model didn't follow instructions), the full response text is used
-  as a single fallback refinement.
-- **30-second timeout**: Refinement calls time out after 30 seconds. On timeout,
-  the input box is unchanged and a notice is shown.
-- **Non-blocking**: The refinement runs asynchronously — the TUI shows a
-  loading spinner while the model generates options.
+- **No tool calls**: `Tools: nil` — pure text generation. The model cannot call
+  bash, edit files, or do any complex processing. It only generates text.
+- **Original always preserved**: The first picker option is always the unmodified
+  original text.
+- **Output format**: The model produces `VERSION:`-prefixed lines. The parser
+  extracts 2–3 versions. If no `VERSION:` lines are found, the full response
+  text is used as a fallback.
+- **30-second timeout**: Refinement calls time out after 30 seconds.
+- **Non-blocking**: The refinement runs asynchronously in the TUI.
 
-### Provider
-
-By default, clarification uses the **same provider/model** as the active
-session, but without tool schemas. You can optionally configure a dedicated
-model for refinement:
-
-```toml
-[agent]
-clarify_model = "deepseek/deepseek-chat"   # optional, falls back to default_model
-```
-
-Use a cheaper or faster model for refinement when your main model is expensive
-or slow. When `clarify_model` is set but invalid, a warning is logged and the
-session provider is used instead.
-
-### Configuration Reference
-
-```toml
-[agent]
-# Optional: use a different model for prompt refinement.
-# When empty (default), the active session model is used.
-clarify_model = "deepseek/deepseek-chat"
-```
-
-## Non-Interactive Mode (`reasonix run --clarify`)
-
-In non-interactive mode (`reasonix run`), add the `--clarify` (or `-C`) flag to
-refine the prompt before submitting it:
+## Non-Interactive Mode (`reasonix run`)
 
 ```bash
+# Fresh mode (prefix-stable, fastest)
 reasonix run --clarify "Write a function to parse CSV files"
+reasonix run -C "Write a function to parse CSV files"
+
+# Context mode (uses resumed session for context)
+reasonix run --clarify-context "Refine our approach"
 ```
 
 Or with stdin:
@@ -159,11 +179,10 @@ echo "Write a function to parse CSV files" | reasonix run --clarify
 ```
 
 The refinement runs automatically:
-1. The prompt is sent to the model with `Tools: nil` — same as the interactive flow
-2. The **first refined version** (not the original) is selected automatically
+1. The prompt is sent to the model with `Tools: nil`
+2. The **first refined version** (index 1) is selected automatically
 3. The before/after diff is printed to stderr
-4. If refinement fails (network error, timeout), a warning is printed and the
-   original prompt is used
+4. If refinement fails, a warning is printed and the original prompt is used
 
 Example output:
 
@@ -173,8 +192,29 @@ Example output:
   after:  Create a CSV parser in internal/parse/csv.go that handles headers, quoted fields, and returns typed rows with error reporting
 ```
 
-The `--clarify` flag works with `--model`, `--max-steps`, `--continue`, and
-other `reasonix run` options.
+## Configuration Reference
+
+```toml
+[clarify]
+# Optional: different model for clarification (default: session model)
+model = "deepseek/deepseek-chat"
+
+# Mode 2 — fresh, prefix-stable request
+[clarify.fresh]
+enabled = true                        # enable this mode (default: true)
+system_prompt = ""                    # custom system prompt (empty = built-in)
+instruction = ""                      # extra guidance before the draft
+max_history_pairs = 2                 # 0 = no history, full cache hits
+
+# Mode 1 — context-aware (full session context)
+[clarify.context]
+enabled = true                        # enable this mode (default: true)
+system_prompt = ""                    # custom system prompt (empty = built-in)
+instruction = "Consider the conversation above when refining."
+```
+
+Legacy `[agent] clarify_model` is still supported but `[clarify].model` takes
+precedence when both are set.
 
 ## Related
 

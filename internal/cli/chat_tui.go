@@ -1103,6 +1103,19 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, m.startClarify(text, "")
+		case "ctrl+shift+k", "meta+k":
+			if m.state == tuiRunning {
+				return m, nil
+			}
+			if m.clarifyPicker != nil {
+				return m, nil
+			}
+			text := m.input.Value()
+			if strings.TrimSpace(text) == "" {
+				m.notice(i18n.M.ClarifyEmpty)
+				return m, nil
+			}
+			return m, m.startClarifyContext(text)
 		case "shift+tab":
 			// Shift+Tab toggles Plan only. Tool approval stays on its own axis:
 			// Ask/Auto are explicit choices, and YOLO is a separate Ctrl+Y toggle.
@@ -1192,12 +1205,21 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if strings.HasPrefix(line, "/clarify") {
 				m.input.Reset()
 				m.pastedBlocks = nil
-				target := strings.TrimSpace(strings.TrimPrefix(line, "/clarify"))
-				if target == "" {
+				rest := strings.TrimSpace(strings.TrimPrefix(line, "/clarify"))
+				useContext := false
+				if strings.HasPrefix(rest, "--context") {
+					useContext = true
+					rest = strings.TrimSpace(strings.TrimPrefix(rest, "--context"))
+				}
+				if rest == "" {
 					m.notice(i18n.M.ClarifyUsage)
 					return m, finalize(m, cmds)
 				}
-				cmds = append(cmds, m.startClarify(target, ""))
+				if useContext {
+					cmds = append(cmds, m.startClarifyContext(rest))
+				} else {
+					cmds = append(cmds, m.startClarify(rest, ""))
+				}
 				return m, finalize(m, cmds)
 			}
 			if strings.HasPrefix(line, "//") {
@@ -3265,6 +3287,25 @@ func (m *chatTUI) startClarify(text, hint string) tea.Cmd {
 	// Run the refinement in a goroutine, send result as tea.Msg
 	return func() tea.Msg {
 		versions, err := m.ctrl.ClarifyPrompt(context.Background(), text)
+		if err != nil {
+			return clarifyResultMsg{err: err}
+		}
+		return clarifyResultMsg{versions: versions}
+	}
+}
+
+// startClarifyContext kicks off a context-aware prompt refinement (mode 1).
+func (m *chatTUI) startClarifyContext(text string) tea.Cmd {
+	m.clarifyPicker = &clarifyPicker{
+		options: []clarifyOption{
+			{index: 0, text: text, label: i18n.M.ClarifyOriginalLabel},
+		},
+		sel:     0,
+		loading: true,
+		pending: text,
+	}
+	return func() tea.Msg {
+		versions, err := m.ctrl.ClarifyPromptContext(context.Background(), text)
 		if err != nil {
 			return clarifyResultMsg{err: err}
 		}
