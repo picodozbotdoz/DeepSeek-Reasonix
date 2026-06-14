@@ -205,16 +205,40 @@ enabled = true                        # enable this mode (default: true)
 system_prompt = ""                    # custom system prompt (empty = built-in)
 instruction = ""                      # extra guidance before the draft
 max_history_pairs = 2                 # 0 = no history, full cache hits
+tool_names = false                    # inject available tool names into instruction
 
 # Mode 1 — context-aware (full session context)
 [clarify.context]
 enabled = true                        # enable this mode (default: true)
 system_prompt = ""                    # custom system prompt (empty = built-in)
 instruction = "Consider the conversation above when refining."
+tool_names = false                    # inject available tool names into instruction
 ```
 
 Legacy `[agent] clarify_model` is still supported but `[clarify].model` takes
 precedence when both are set.
+
+## Tool-Aware Refinement
+
+When `tool_names = true` in either mode, the clarifier injects a compact list
+of available tool names into the instruction:
+
+```
+Available tools: bash, read_file, write_file, edit_file, grep, glob, ls,
+web_fetch, codegraph_explore, codegraph_search, lsp_definition, ...
+```
+
+This lets the refiner suggest prompts that use specific tools effectively —
+for example, "Use `codegraph_explore` to trace the call graph, then
+`edit_file` to fix the bug."
+
+Since tool names are static per session (the same set every turn), they form
+part of the cache-stable prefix in mode 2 (Fresh). Enabling tool names does
+not affect cache hit rates.
+
+In mode 1 (Context), the session messages already include past tool calls and
+results, so `tool_names` adds the full catalog of available tools — including
+those the user hasn't used yet in this session.
 
 ## Related
 

@@ -496,6 +496,9 @@ type ClarifyFreshMode struct {
 	SystemPrompt    string `toml:"system_prompt"`
 	Instruction     string `toml:"instruction"`
 	MaxHistoryPairs int    `toml:"max_history_pairs"`
+	// ToolNames, when true, injects available tool names into the instruction
+	// so the refiner can suggest tool-specific prompts.
+	ToolNames bool `toml:"tool_names"`
 }
 
 // ClarifyContextMode is the session-aware clarification mode. The request sends
@@ -505,6 +508,9 @@ type ClarifyContextMode struct {
 	Enabled      bool   `toml:"enabled"`
 	SystemPrompt string `toml:"system_prompt"`
 	Instruction  string `toml:"instruction"`
+	// ToolNames, when true, injects available tool names into the instruction
+	// so the refiner can suggest prompts that use specific tools effectively.
+	ToolNames bool `toml:"tool_names"`
 }
 
 // BuiltInMCPConfig controls Reasonix-shipped MCP servers that require no user

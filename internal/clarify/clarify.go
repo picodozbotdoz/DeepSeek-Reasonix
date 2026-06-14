@@ -32,47 +32,63 @@ VERSION: Update the auth package to use the new JWT library: rewrite handler.go,
 `
 
 // Refine calls the provider to generate 2–3 prompt refinements (backward-
-// compatible alias — delegates to RefineFresh with no history).
+// compatible alias — delegates to RefineFresh with no history and no tools).
 // input is the user's raw prompt text.
 // Returns the original + refined versions (at least 1 — original is always first).
 func Refine(ctx context.Context, prov provider.Provider, input, focusHint string) ([]string, error) {
-	return RefineFresh(ctx, prov, input, nil, focusHint, SystemPrompt, "", 0)
+	return RefineFresh(ctx, prov, input, nil, focusHint, SystemPrompt, "", 0, nil)
+}
+
+// buildUserMessage constructs the user message for a clarify request.
+// instruction is optional guidance; toolNames are injected when non-empty;
+// history is formatted as compact pairs; focusHint is appended after the draft.
+func buildUserMessage(instruction string, toolNames []string, history string, input, focusHint string) string {
+	var parts []string
+
+	// Tool names, when provided, are injected before the instruction so they
+	// are part of the cache-stable prefix (same tools every session).
+	if len(toolNames) > 0 {
+		toolLine := "Available tools: " + strings.Join(toolNames, ", ")
+		if instruction != "" {
+			parts = append(parts, toolLine+"\n"+instruction)
+		} else {
+			parts = append(parts, toolLine)
+		}
+	} else if instruction != "" {
+		parts = append(parts, instruction)
+	}
+
+	if history != "" {
+		parts = append(parts, history)
+	}
+	parts = append(parts, "Draft:\n"+input)
+	if focusHint != "" {
+		parts = append(parts, "\n\nFocus: "+focusHint)
+	}
+	return strings.Join(parts, "\n\n")
 }
 
 // RefineFresh is the prefix-stable clarification mode (mode 2). It builds a
 // fresh provider.Request with a stable prefix — system prompt + instruction +
-// optional history — followed by "Draft:\n" + input. The focus hint, when set,
-// is appended after the draft so the prefix stays cacheable.
+// optional tool names + optional history — followed by "Draft:\n" + input.
+// toolNames, when non-empty, is injected into the instruction so the refiner
+// can suggest tool-specific prompts. Since tool names are static per session
+// they keep the prefix cacheable.
 //
 // Cache boundary:
 //
 //	[system prompt]         — fixed, cached across calls
+//	[tool names]            — fixed per session, cached ("" = no-op)
 //	[instruction]           — fixed, cached ("" = no-op)
 //	[history(maxPairs)]     — variable content, fixed size; cache miss on content change
 //	[Draft:\n + input]      — fixed prefix "Draft:\n" cached; input varies
-//
-// When maxPairs is 0 and instruction is "", the behaviour is identical to the
-// original Refine().
-func RefineFresh(ctx context.Context, prov provider.Provider, input string, history []provider.Message, focusHint, sysPrompt, instruction string, maxPairs int) ([]string, error) {
+func RefineFresh(ctx context.Context, prov provider.Provider, input string, history []provider.Message, focusHint, sysPrompt, instruction string, maxPairs int, toolNames []string) ([]string, error) {
 	if strings.TrimSpace(input) == "" {
 		return nil, fmt.Errorf("cannot clarify empty input")
 	}
 
-	// Build the user message with a stable cache boundary.
-	var userParts []string
-	if instruction != "" {
-		userParts = append(userParts, instruction)
-	}
-	if hist := formatHistory(history, maxPairs); hist != "" {
-		userParts = append(userParts, hist)
-	}
-	userParts = append(userParts, "Draft:\n"+input)
-	if focusHint != "" {
-		userParts = append(userParts, "\n\nFocus: "+focusHint)
-	}
-	userMsg := strings.Join(userParts, "\n\n")
+	userMsg := buildUserMessage(instruction, toolNames, formatHistory(history, maxPairs), input, focusHint)
 
-	// Use the default system prompt when none is configured.
 	sys := sysPrompt
 	if sys == "" {
 		sys = SystemPrompt
@@ -98,7 +114,7 @@ func RefineFresh(ctx context.Context, prov provider.Provider, input string, hist
 //
 // sessionMsgs should already be filtered (no RoleTool messages).
 // The draft is appended as the last user message with "Draft:\n" prefix.
-func RefineContextual(ctx context.Context, prov provider.Provider, input string, sessionMsgs []provider.Message, focusHint, sysPrompt, instruction string) ([]string, error) {
+func RefineContextual(ctx context.Context, prov provider.Provider, input string, sessionMsgs []provider.Message, focusHint, sysPrompt, instruction string, toolNames []string) ([]string, error) {
 	if strings.TrimSpace(input) == "" {
 		return nil, fmt.Errorf("cannot clarify empty input")
 	}
@@ -111,9 +127,18 @@ func RefineContextual(ctx context.Context, prov provider.Provider, input string,
 	msgs := make([]provider.Message, 0, len(sessionMsgs)+2)
 	msgs = append(msgs, provider.Message{Role: provider.RoleSystem, Content: sys})
 
-	// Add instruction as a user message if set (guidance, not a draft).
-	if instruction != "" {
-		msgs = append(msgs, provider.Message{Role: provider.RoleUser, Content: instruction})
+	// Build instruction with tool names injected when provided.
+	inst := instruction
+	if len(toolNames) > 0 {
+		toolLine := "Available tools: " + strings.Join(toolNames, ", ")
+		if inst != "" {
+			inst = toolLine + "\n" + inst
+		} else {
+			inst = toolLine
+		}
+	}
+	if inst != "" {
+		msgs = append(msgs, provider.Message{Role: provider.RoleUser, Content: inst})
 	}
 
 	// Add the filtered session messages (user + assistant turns).

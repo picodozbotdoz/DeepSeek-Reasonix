@@ -56,11 +56,13 @@ enabled = true
 system_prompt = "Custom fresh prompt"
 instruction = "Make it concise"
 max_history_pairs = 3
+tool_names = true
 
 [clarify.context]
 enabled = false
 system_prompt = "Custom context prompt"
 instruction = "Use full context"
+tool_names = true
 `, &cfg); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
@@ -80,6 +82,9 @@ instruction = "Use full context"
 	if cfg.Clarify.Fresh.MaxHistoryPairs != 3 {
 		t.Fatalf("Clarify.Fresh.MaxHistoryPairs = %d", cfg.Clarify.Fresh.MaxHistoryPairs)
 	}
+	if !cfg.Clarify.Fresh.ToolNames {
+		t.Fatal("Clarify.Fresh.ToolNames should be true")
+	}
 	if cfg.Clarify.Context.Enabled {
 		t.Fatal("Clarify.Context.Enabled should be false")
 	}
@@ -88,6 +93,9 @@ instruction = "Use full context"
 	}
 	if cfg.Clarify.Context.Instruction != "Use full context" {
 		t.Fatalf("Clarify.Context.Instruction = %q", cfg.Clarify.Context.Instruction)
+	}
+	if !cfg.Clarify.Context.ToolNames {
+		t.Fatal("Clarify.Context.ToolNames should be true")
 	}
 }
 

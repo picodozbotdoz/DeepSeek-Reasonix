@@ -2665,7 +2665,7 @@ func (c *Controller) ForgetMemory(name string) error {
 
 // ClarifyPrompt refines the user's input text via a fresh, prefix-stable LLM
 // call (mode 2). Uses ClarifyConfig.Fresh settings for system prompt,
-// instruction, and history depth.
+// instruction, history depth, and tool names.
 func (c *Controller) ClarifyPrompt(ctx context.Context, input string) ([]string, error) {
 	if strings.TrimSpace(input) == "" {
 		return nil, fmt.Errorf("nothing to clarify")
@@ -2677,6 +2677,7 @@ func (c *Controller) ClarifyPrompt(ctx context.Context, input string) ([]string,
 	sysPrompt := c.clarifyCfg.Fresh.SystemPrompt
 	instruction := c.clarifyCfg.Fresh.Instruction
 	maxPairs := c.clarifyCfg.Fresh.MaxHistoryPairs
+	toolNames := c.clarifyToolNames(c.clarifyCfg.Fresh.ToolNames)
 
 	// Collect conversation history from the session if maxPairs > 0.
 	var history []provider.Message
@@ -2684,7 +2685,7 @@ func (c *Controller) ClarifyPrompt(ctx context.Context, input string) ([]string,
 		history = c.executor.Session().Snapshot()
 	}
 
-	return clarify.RefineFresh(ctx, c.clarifyProv, input, history, "", sysPrompt, instruction, maxPairs)
+	return clarify.RefineFresh(ctx, c.clarifyProv, input, history, "", sysPrompt, instruction, maxPairs, toolNames)
 }
 
 // ClarifyPromptContext refines the user's input text by sending full session
@@ -2699,6 +2700,7 @@ func (c *Controller) ClarifyPromptContext(ctx context.Context, input string) ([]
 
 	sysPrompt := c.clarifyCfg.Context.SystemPrompt
 	instruction := c.clarifyCfg.Context.Instruction
+	toolNames := c.clarifyToolNames(c.clarifyCfg.Context.ToolNames)
 
 	// Collect the full session history for context-aware refinement.
 	var sessionMsgs []provider.Message
@@ -2706,7 +2708,17 @@ func (c *Controller) ClarifyPromptContext(ctx context.Context, input string) ([]
 		sessionMsgs = c.executor.Session().Snapshot()
 	}
 
-	return clarify.RefineContextual(ctx, c.clarifyProv, input, sessionMsgs, "", sysPrompt, instruction)
+	return clarify.RefineContextual(ctx, c.clarifyProv, input, sessionMsgs, "", sysPrompt, instruction, toolNames)
+}
+
+// clarifyToolNames returns the list of registered tool names when enabled is
+// true, or nil when disabled. The names are sorted and consistent per session,
+// so they form part of the cache-stable prefix in mode 2.
+func (c *Controller) clarifyToolNames(enabled bool) []string {
+	if !enabled || c.reg == nil {
+		return nil
+	}
+	return c.reg.Names()
 }
 
 // QueueMemory implements memory.Queue: when the model runs the remember/forget
