@@ -131,3 +131,83 @@ model = "new-model"
 		t.Fatalf("ClarifyModel() should prefer new model, got %q", got)
 	}
 }
+
+func TestClarifyConfigVersionsAndTokensDecode(t *testing.T) {
+	var cfg Config
+	if _, err := toml.Decode(`
+[clarify.fresh]
+max_versions = 4
+max_tokens = 2048
+
+[clarify.context]
+max_versions = 2
+max_tokens = 512
+`, &cfg); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if cfg.Clarify.Fresh.MaxVersions != 4 {
+		t.Fatalf("Fresh.MaxVersions = %d, want 4", cfg.Clarify.Fresh.MaxVersions)
+	}
+	if cfg.Clarify.Fresh.MaxTokens != 2048 {
+		t.Fatalf("Fresh.MaxTokens = %d, want 2048", cfg.Clarify.Fresh.MaxTokens)
+	}
+	if cfg.Clarify.Context.MaxVersions != 2 {
+		t.Fatalf("Context.MaxVersions = %d, want 2", cfg.Clarify.Context.MaxVersions)
+	}
+	if cfg.Clarify.Context.MaxTokens != 512 {
+		t.Fatalf("Context.MaxTokens = %d, want 512", cfg.Clarify.Context.MaxTokens)
+	}
+}
+
+func TestClarifyEffectiveVersions(t *testing.T) {
+	m := ClarifyFreshMode{}
+	if v := m.EffectiveVersions(); v != 3 {
+		t.Fatalf("default effective versions = %d, want 3", v)
+	}
+	m = ClarifyFreshMode{MaxVersions: 10}
+	if v := m.EffectiveVersions(); v != 5 {
+		t.Fatalf("clamped effective versions = %d, want 5", v)
+	}
+	m = ClarifyFreshMode{MaxVersions: 0}
+	if v := m.EffectiveVersions(); v != 3 {
+		t.Fatalf("zero effective versions = %d, want 3", v)
+	}
+	m = ClarifyFreshMode{MaxVersions: 2}
+	if v := m.EffectiveVersions(); v != 2 {
+		t.Fatalf("configured effective versions = %d, want 2", v)
+	}
+
+	// Same for Context mode.
+	cm := ClarifyContextMode{}
+	if v := cm.EffectiveVersions(); v != 3 {
+		t.Fatalf("context default effective versions = %d, want 3", v)
+	}
+}
+
+func TestClarifyEffectiveTokens(t *testing.T) {
+	m := ClarifyFreshMode{}
+	if v := m.EffectiveTokens(); v != 1024 {
+		t.Fatalf("default effective tokens = %d, want 1024", v)
+	}
+	m = ClarifyFreshMode{MaxTokens: 5000}
+	if v := m.EffectiveTokens(); v != 4096 {
+		t.Fatalf("clamped effective tokens = %d, want 4096", v)
+	}
+	m = ClarifyFreshMode{MaxTokens: 100}
+	if v := m.EffectiveTokens(); v != 256 {
+		t.Fatalf("floor effective tokens = %d, want 256", v)
+	}
+	m = ClarifyFreshMode{MaxTokens: 0}
+	if v := m.EffectiveTokens(); v != 1024 {
+		t.Fatalf("zero effective tokens = %d, want 1024", v)
+	}
+	m = ClarifyFreshMode{MaxTokens: 512}
+	if v := m.EffectiveTokens(); v != 512 {
+		t.Fatalf("configured effective tokens = %d, want 512", v)
+	}
+
+	cm := ClarifyContextMode{}
+	if v := cm.EffectiveTokens(); v != 1024 {
+		t.Fatalf("context default effective tokens = %d, want 1024", v)
+	}
+}

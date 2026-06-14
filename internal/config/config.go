@@ -499,6 +499,12 @@ type ClarifyFreshMode struct {
 	// ToolNames, when true, injects available tool names into the instruction
 	// so the refiner can suggest tool-specific prompts.
 	ToolNames bool `toml:"tool_names"`
+	// MaxVersions caps the number of refined versions per call. 0 = default (3).
+	// Valid range: 1–5. Higher values cost more tokens but give more variety.
+	MaxVersions int `toml:"max_versions"`
+	// MaxTokens caps the model's output tokens per refinement call. 0 = default (1024).
+	// Valid range: 256–4096. Higher values allow longer refinements.
+	MaxTokens int `toml:"max_tokens"`
 }
 
 // ClarifyContextMode is the session-aware clarification mode. The request sends
@@ -511,6 +517,72 @@ type ClarifyContextMode struct {
 	// ToolNames, when true, injects available tool names into the instruction
 	// so the refiner can suggest prompts that use specific tools effectively.
 	ToolNames bool `toml:"tool_names"`
+	// MaxVersions caps the number of refined versions per call. 0 = default (3).
+	MaxVersions int `toml:"max_versions"`
+	// MaxTokens caps the model's output tokens per refinement call. 0 = default (1024).
+	MaxTokens int `toml:"max_tokens"`
+}
+
+// DefaultClarifyVersions returns the default number of refined versions.
+const DefaultClarifyVersions = 3
+
+// DefaultClarifyTokens returns the default max output tokens for refinement.
+const DefaultClarifyTokens = 1024
+
+// EffectiveVersions returns the configured version count, clamped to valid range.
+func (m ClarifyFreshMode) EffectiveVersions() int {
+	if m.MaxVersions <= 0 {
+		return DefaultClarifyVersions
+	}
+	if m.MaxVersions > 5 {
+		return 5
+	}
+	if m.MaxVersions < 1 {
+		return 1
+	}
+	return m.MaxVersions
+}
+
+// EffectiveTokens returns the configured max tokens, clamped to valid range.
+func (m ClarifyFreshMode) EffectiveTokens() int {
+	if m.MaxTokens <= 0 {
+		return DefaultClarifyTokens
+	}
+	if m.MaxTokens > 4096 {
+		return 4096
+	}
+	if m.MaxTokens < 256 {
+		return 256
+	}
+	return m.MaxTokens
+}
+
+// EffectiveVersions returns the configured version count, clamped to valid range.
+func (m ClarifyContextMode) EffectiveVersions() int {
+	if m.MaxVersions <= 0 {
+		return DefaultClarifyVersions
+	}
+	if m.MaxVersions > 5 {
+		return 5
+	}
+	if m.MaxVersions < 1 {
+		return 1
+	}
+	return m.MaxVersions
+}
+
+// EffectiveTokens returns the configured max tokens, clamped to valid range.
+func (m ClarifyContextMode) EffectiveTokens() int {
+	if m.MaxTokens <= 0 {
+		return DefaultClarifyTokens
+	}
+	if m.MaxTokens > 4096 {
+		return 4096
+	}
+	if m.MaxTokens < 256 {
+		return 256
+	}
+	return m.MaxTokens
 }
 
 // BuiltInMCPConfig controls Reasonix-shipped MCP servers that require no user

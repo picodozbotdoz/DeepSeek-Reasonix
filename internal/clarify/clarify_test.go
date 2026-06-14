@@ -56,9 +56,9 @@ func TestParseVersions(t *testing.T) {
 			want: 1,
 		},
 		{
-			name: "capped at 3",
+			name: "capped at 5",
 			in:   "VERSION: A\nVERSION: B\nVERSION: C\nVERSION: D\nVERSION: E",
-			want: 3,
+			want: 5,
 		},
 		{
 			name: "mixed case VERSION prefix",
@@ -69,7 +69,7 @@ func TestParseVersions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := parseVersions(tt.in)
+			got := parseVersions(tt.in, 5)
 			if len(got) != tt.want {
 				t.Errorf("parseVersions() returned %d versions, want %d\n  result: %v", len(got), tt.want, got)
 			}
@@ -216,7 +216,7 @@ func (s *streamProvider) Stream(_ context.Context, _ provider.Request) (<-chan p
 func TestRefineFresh(t *testing.T) {
 	t.Run("basic no history", func(t *testing.T) {
 		prov := &mockProvider{text: "VERSION: First\nVERSION: Second"}
-		results, err := RefineFresh(context.Background(), prov, "my draft", nil, "", "", "", 0, nil)
+		results, err := RefineFresh(context.Background(), prov, "my draft", nil, "", "", "", 0, nil, 3, 1024)
 		if err != nil {
 			t.Fatalf("RefineFresh error: %v", err)
 		}
@@ -230,7 +230,7 @@ func TestRefineFresh(t *testing.T) {
 
 	t.Run("with custom system prompt", func(t *testing.T) {
 		prov := &mockProvider{text: "VERSION: A"}
-		results, err := RefineFresh(context.Background(), prov, "test", nil, "", "Custom sys prompt", "", 0, nil)
+		results, err := RefineFresh(context.Background(), prov, "test", nil, "", "Custom sys prompt", "", 0, nil, 3, 1024)
 		if err != nil {
 			t.Fatalf("RefineFresh error: %v", err)
 		}
@@ -245,7 +245,7 @@ func TestRefineFresh(t *testing.T) {
 			{Role: provider.RoleUser, Content: "first question"},
 			{Role: provider.RoleAssistant, Content: "first answer"},
 		}
-		results, err := RefineFresh(context.Background(), prov, "new draft", history, "", "", "", 1, nil)
+		results, err := RefineFresh(context.Background(), prov, "new draft", history, "", "", "", 1, nil, 3, 1024)
 		if err != nil {
 			t.Fatalf("RefineFresh with history error: %v", err)
 		}
@@ -256,7 +256,7 @@ func TestRefineFresh(t *testing.T) {
 
 	t.Run("focus hint after draft", func(t *testing.T) {
 		prov := &mockProvider{text: "VERSION: Focused"}
-		results, err := RefineFresh(context.Background(), prov, "my draft", nil, "be more specific", "", "", 0, nil)
+		results, err := RefineFresh(context.Background(), prov, "my draft", nil, "be more specific", "", "", 0, nil, 3, 1024)
 		if err != nil {
 			t.Fatalf("RefineFresh with focus hint error: %v", err)
 		}
@@ -266,7 +266,7 @@ func TestRefineFresh(t *testing.T) {
 	})
 
 	t.Run("empty input fails", func(t *testing.T) {
-		_, err := RefineFresh(context.Background(), &mockProvider{}, "", nil, "", "", "", 0, nil)
+		_, err := RefineFresh(context.Background(), &mockProvider{}, "", nil, "", "", "", 0, nil, 3, 1024)
 		if err == nil {
 			t.Fatal("expected error for empty input")
 		}
@@ -282,7 +282,7 @@ func TestRefineContextual(t *testing.T) {
 			{Role: provider.RoleUser, Content: "here it is: func main() {}"},
 			{Role: provider.RoleAssistant, Content: "I see the issue"},
 		}
-		results, err := RefineContextual(context.Background(), prov, "fix the bug", session, "", "", "", nil)
+		results, err := RefineContextual(context.Background(), prov, "fix the bug", session, "", "", "", nil, 3, 1024)
 		if err != nil {
 			t.Fatalf("RefineContextual error: %v", err)
 		}
@@ -301,7 +301,7 @@ func TestRefineContextual(t *testing.T) {
 			{Role: provider.RoleAssistant, Content: "hi"},
 			{Role: provider.RoleTool, Content: "some tool output"},
 		}
-		results, err := RefineContextual(context.Background(), prov, "test", session, "", "", "", nil)
+		results, err := RefineContextual(context.Background(), prov, "test", session, "", "", "", nil, 3, 1024)
 		if err != nil {
 			t.Fatalf("RefineContextual error: %v", err)
 		}
@@ -311,7 +311,7 @@ func TestRefineContextual(t *testing.T) {
 	})
 
 	t.Run("empty input fails", func(t *testing.T) {
-		_, err := RefineContextual(context.Background(), &mockProvider{}, "", nil, "", "", "", nil)
+		_, err := RefineContextual(context.Background(), &mockProvider{}, "", nil, "", "", "", nil, 3, 1024)
 		if err == nil {
 			t.Fatal("expected error for empty input")
 		}
@@ -323,7 +323,7 @@ func TestRefineContextual(t *testing.T) {
 			{Role: provider.RoleUser, Content: "earlier message"},
 			{Role: provider.RoleAssistant, Content: "earlier response"},
 		}
-		results, err := RefineContextual(context.Background(), prov, "final draft", session, "", "Custom sys", "Use the context", nil)
+		results, err := RefineContextual(context.Background(), prov, "final draft", session, "", "Custom sys", "Use the context", nil, 3, 1024)
 		if err != nil {
 			t.Fatalf("RefineContextual error: %v", err)
 		}

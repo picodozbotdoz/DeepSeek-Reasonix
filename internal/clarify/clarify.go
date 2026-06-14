@@ -13,10 +13,16 @@ import (
 	"reasonix/internal/provider"
 )
 
-// SystemPrompt instructs the model to produce 2–3 refined prompt versions.
-// Used as the default when no custom system prompt is configured.
-const SystemPrompt = `You are a prompt refinement assistant for a coding agent called Reasonix.
-The user has written a draft prompt for the agent. Your job is to produce 2–3 improved versions.
+// DefaultVersions is the default number of refined versions per call.
+const DefaultVersions = 3
+
+// DefaultMaxTokens is the default max output tokens for a refinement call.
+const DefaultMaxTokens = 1024
+
+// SystemPromptFmt is a format string for the refinement system prompt.
+// The %d placeholder is replaced with the desired number of versions.
+const SystemPromptFmt = `You are a prompt refinement assistant for a coding agent called Reasonix.
+The user has written a draft prompt for the agent. Your job is to produce %d improved versions.
 Each version should be a clear, specific, actionable instruction that helps the agent understand
 what the user wants. Consider:
 - Making vague requests concrete
@@ -24,19 +30,21 @@ what the user wants. Consider:
 - Adding relevant context (files, paths, constraints) when inferable
 - Keeping the user's original intent and voice
 
-Output exactly 2–3 versions, each on a line starting with "VERSION:" followed by the text.
+Output exactly %d versions, each on a line starting with "VERSION:" followed by the text.
 Do not include numbering, markdown, or extra commentary — just the VERSION: lines.
 Example:
 VERSION: Refactor the authentication handler in internal/auth/ to use the new JWT library. Update the signing key rotation logic and add tests.
 VERSION: Update the auth package to use the new JWT library: rewrite handler.go, update key rotation, and add unit tests covering the new flow.
 `
 
-// Refine calls the provider to generate 2–3 prompt refinements (backward-
-// compatible alias — delegates to RefineFresh with no history and no tools).
-// input is the user's raw prompt text.
-// Returns the original + refined versions (at least 1 — original is always first).
+// SystemPrompt is the default system prompt for 3 versions. Kept for backward
+// compatibility; new code should use SystemPromptFmt with the desired count.
+var SystemPrompt = fmt.Sprintf(SystemPromptFmt, DefaultVersions, DefaultVersions)
+
+// Refine calls the provider to generate prompt refinements (backward-
+// compatible alias — delegates to RefineFresh with defaults).
 func Refine(ctx context.Context, prov provider.Provider, input, focusHint string) ([]string, error) {
-	return RefineFresh(ctx, prov, input, nil, focusHint, SystemPrompt, "", 0, nil)
+	return RefineFresh(ctx, prov, input, nil, focusHint, "", "", 0, nil, DefaultVersions, DefaultMaxTokens)
 }
 
 // buildUserMessage constructs the user message for a clarify request.
@@ -82,7 +90,7 @@ func buildUserMessage(instruction string, toolNames []string, history string, in
 //	[instruction]           — fixed, cached ("" = no-op)
 //	[history(maxPairs)]     — variable content, fixed size; cache miss on content change
 //	[Draft:\n + input]      — fixed prefix "Draft:\n" cached; input varies
-func RefineFresh(ctx context.Context, prov provider.Provider, input string, history []provider.Message, focusHint, sysPrompt, instruction string, maxPairs int, toolNames []string) ([]string, error) {
+func RefineFresh(ctx context.Context, prov provider.Provider, input string, history []provider.Message, focusHint, sysPrompt, instruction string, maxPairs int, toolNames []string, maxVersions, maxTokens int) ([]string, error) {
 	if strings.TrimSpace(input) == "" {
 		return nil, fmt.Errorf("cannot clarify empty input")
 	}
@@ -91,7 +99,16 @@ func RefineFresh(ctx context.Context, prov provider.Provider, input string, hist
 
 	sys := sysPrompt
 	if sys == "" {
-		sys = SystemPrompt
+		versions := maxVersions
+		if versions <= 0 {
+			versions = DefaultVersions
+		}
+		sys = fmt.Sprintf(SystemPromptFmt, versions, versions)
+	}
+
+	tok := maxTokens
+	if tok <= 0 {
+		tok = DefaultMaxTokens
 	}
 
 	req := provider.Request{
@@ -99,12 +116,12 @@ func RefineFresh(ctx context.Context, prov provider.Provider, input string, hist
 			{Role: provider.RoleSystem, Content: sys},
 			{Role: provider.RoleUser, Content: userMsg},
 		},
-		Tools:       nil, // NO tools — pure text generation
-		Temperature: 0.7, // slight creativity for diverse versions
-		MaxTokens:   1024,
+		Tools:       nil,
+		Temperature: 0.7,
+		MaxTokens:   tok,
 	}
 
-	return refineCall(ctx, prov, req, input)
+	return refineCall(ctx, prov, req, input, maxVersions)
 }
 
 // RefineContextual is the session-aware clarification mode (mode 1). It sends
@@ -114,14 +131,23 @@ func RefineFresh(ctx context.Context, prov provider.Provider, input string, hist
 //
 // sessionMsgs should already be filtered (no RoleTool messages).
 // The draft is appended as the last user message with "Draft:\n" prefix.
-func RefineContextual(ctx context.Context, prov provider.Provider, input string, sessionMsgs []provider.Message, focusHint, sysPrompt, instruction string, toolNames []string) ([]string, error) {
+func RefineContextual(ctx context.Context, prov provider.Provider, input string, sessionMsgs []provider.Message, focusHint, sysPrompt, instruction string, toolNames []string, maxVersions, maxTokens int) ([]string, error) {
 	if strings.TrimSpace(input) == "" {
 		return nil, fmt.Errorf("cannot clarify empty input")
 	}
 
 	sys := sysPrompt
 	if sys == "" {
-		sys = SystemPrompt
+		versions := maxVersions
+		if versions <= 0 {
+			versions = DefaultVersions
+		}
+		sys = fmt.Sprintf(SystemPromptFmt, versions, versions)
+	}
+
+	tok := maxTokens
+	if tok <= 0 {
+		tok = DefaultMaxTokens
 	}
 
 	msgs := make([]provider.Message, 0, len(sessionMsgs)+2)
@@ -160,14 +186,14 @@ func RefineContextual(ctx context.Context, prov provider.Provider, input string,
 		Messages:    msgs,
 		Tools:       nil,
 		Temperature: 0.7,
-		MaxTokens:   1024,
+		MaxTokens:   tok,
 	}
 
-	return refineCall(ctx, prov, req, input)
+	return refineCall(ctx, prov, req, input, maxVersions)
 }
 
 // refineCall sends the request, streams the response, and parses VERSION: lines.
-func refineCall(ctx context.Context, prov provider.Provider, req provider.Request, originalInput string) ([]string, error) {
+func refineCall(ctx context.Context, prov provider.Provider, req provider.Request, originalInput string, maxVersions int) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -192,12 +218,11 @@ loop:
 			case provider.ChunkError:
 				return nil, fmt.Errorf("clarify: %w", chunk.Err)
 			case provider.ChunkToolCallStart, provider.ChunkToolCall:
-				// Ignore — Tools: nil means the model shouldn't produce these.
 			}
 		}
 	}
 
-	versions := parseVersions(sb.String())
+	versions := parseVersions(sb.String(), maxVersions)
 	if len(versions) == 0 {
 		trimmed := strings.TrimSpace(sb.String())
 		if trimmed != "" {
@@ -257,7 +282,13 @@ func formatHistory(msgs []provider.Message, maxPairs int) string {
 }
 
 // parseVersions extracts VERSION:-prefixed lines from the model output.
-func parseVersions(text string) []string {
+// max caps the number of versions returned; 0 or negative means use DefaultVersions.
+func parseVersions(text string, max int) []string {
+	cap := DefaultVersions
+	if max > 0 {
+		cap = max
+	}
+
 	var versions []string
 	for _, line := range strings.Split(text, "\n") {
 		trimmed := strings.TrimSpace(line)
@@ -265,11 +296,11 @@ func parseVersions(text string) []string {
 			v := strings.TrimSpace(after)
 			if v != "" {
 				versions = append(versions, v)
+				if len(versions) >= cap {
+					break
+				}
 			}
 		}
-	}
-	if len(versions) > 3 {
-		versions = versions[:3]
 	}
 	return versions
 }

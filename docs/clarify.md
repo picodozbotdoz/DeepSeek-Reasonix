@@ -206,6 +206,8 @@ system_prompt = ""                    # custom system prompt (empty = built-in)
 instruction = ""                      # extra guidance before the draft
 max_history_pairs = 2                 # 0 = no history, full cache hits
 tool_names = false                    # inject available tool names into instruction
+max_versions = 3                      # 1–5, number of refined versions per call (0 = default 3)
+max_tokens = 1024                     # 256–4096, max output tokens per call (0 = default 1024)
 
 # Mode 1 — context-aware (full session context)
 [clarify.context]
@@ -213,6 +215,8 @@ enabled = true                        # enable this mode (default: true)
 system_prompt = ""                    # custom system prompt (empty = built-in)
 instruction = "Consider the conversation above when refining."
 tool_names = false                    # inject available tool names into instruction
+max_versions = 3                      # 1–5, number of refined versions per call
+max_tokens = 1024                     # 256–4096, max output tokens per call
 ```
 
 Legacy `[agent] clarify_model` is still supported but `[clarify].model` takes

@@ -2678,6 +2678,8 @@ func (c *Controller) ClarifyPrompt(ctx context.Context, input string) ([]string,
 	instruction := c.clarifyCfg.Fresh.Instruction
 	maxPairs := c.clarifyCfg.Fresh.MaxHistoryPairs
 	toolNames := c.clarifyToolNames(c.clarifyCfg.Fresh.ToolNames)
+	maxVersions := c.clarifyCfg.Fresh.EffectiveVersions()
+	maxTokens := c.clarifyCfg.Fresh.EffectiveTokens()
 
 	// Collect conversation history from the session if maxPairs > 0.
 	var history []provider.Message
@@ -2685,7 +2687,7 @@ func (c *Controller) ClarifyPrompt(ctx context.Context, input string) ([]string,
 		history = c.executor.Session().Snapshot()
 	}
 
-	return clarify.RefineFresh(ctx, c.clarifyProv, input, history, "", sysPrompt, instruction, maxPairs, toolNames)
+	return clarify.RefineFresh(ctx, c.clarifyProv, input, history, "", sysPrompt, instruction, maxPairs, toolNames, maxVersions, maxTokens)
 }
 
 // ClarifyPromptContext refines the user's input text by sending full session
@@ -2701,6 +2703,8 @@ func (c *Controller) ClarifyPromptContext(ctx context.Context, input string) ([]
 	sysPrompt := c.clarifyCfg.Context.SystemPrompt
 	instruction := c.clarifyCfg.Context.Instruction
 	toolNames := c.clarifyToolNames(c.clarifyCfg.Context.ToolNames)
+	maxVersions := c.clarifyCfg.Context.EffectiveVersions()
+	maxTokens := c.clarifyCfg.Context.EffectiveTokens()
 
 	// Collect the full session history for context-aware refinement.
 	var sessionMsgs []provider.Message
@@ -2708,7 +2712,7 @@ func (c *Controller) ClarifyPromptContext(ctx context.Context, input string) ([]
 		sessionMsgs = c.executor.Session().Snapshot()
 	}
 
-	return clarify.RefineContextual(ctx, c.clarifyProv, input, sessionMsgs, "", sysPrompt, instruction, toolNames)
+	return clarify.RefineContextual(ctx, c.clarifyProv, input, sessionMsgs, "", sysPrompt, instruction, toolNames, maxVersions, maxTokens)
 }
 
 // clarifyToolNames returns the list of registered tool names when enabled is
