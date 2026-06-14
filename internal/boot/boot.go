@@ -845,7 +845,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		home, _ := os.UserHomeDir()
 		cahooksCfg := cahooks.LoadAll(root, home)
 		if cahooksCfg != nil && len(cahooksCfg.Hooks) > 0 {
-			executor.SetCAHooks(cahooks.NewManager(cahooksCfg, execProv))
+			executor.SetCAHooks(cahooks.NewManager(cahooksCfg, execProv, sink))
 		}
 	}
 

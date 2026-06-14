@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"reasonix/internal/event"
 	"reasonix/internal/provider"
 )
 
@@ -18,13 +19,15 @@ import (
 type Manager struct {
 	cfg     *Config
 	prov    provider.Provider
+	sink    event.Sink
+	debug   bool
 	mu      sync.Mutex
 	running int // number of async hooks currently running
 }
 
 // NewManager creates a cahooks manager.
-func NewManager(cfg *Config, prov provider.Provider) *Manager {
-	return &Manager{cfg: cfg, prov: prov}
+func NewManager(cfg *Config, prov provider.Provider, sink event.Sink) *Manager {
+	return &Manager{cfg: cfg, prov: prov, sink: sink, debug: cfg != nil && cfg.Debug}
 }
 
 // RunHooks fires all enabled hooks matching the given trigger and state.
@@ -83,6 +86,20 @@ func (m *Manager) runOne(ctx context.Context, hook HookConfig, state State, sess
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	startTime := time.Now()
+
+	// Debug: emit start event
+	if m.debug && m.sink != nil {
+		m.sink.Emit(event.Event{
+			Kind: event.ToolDispatch,
+			Tool: event.Tool{
+				ID:   fmt.Sprintf("cahook-%s-%d", hook.Name, state.Turn),
+				Name: fmt.Sprintf("cahook:%s", hook.Name),
+				Args: fmt.Sprintf(`{"trigger":"%s","turn":%d}`, hook.Trigger, state.Turn),
+			},
+		})
+	}
+
 	// Build payload
 	payload := BuildPayload(
 		hook.Trigger,
@@ -115,12 +132,36 @@ func (m *Manager) runOne(ctx context.Context, hook HookConfig, state State, sess
 	// Step 3: Call LLM
 	response, err := CallAnalysis(ctx, m.prov, session, analysisPrompt)
 	if err != nil {
+		// Debug: emit error result
+		if m.debug && m.sink != nil {
+			m.sink.Emit(event.Event{
+				Kind: event.ToolResult,
+				Tool: event.Tool{
+					ID:         fmt.Sprintf("cahook-%s-%d", hook.Name, state.Turn),
+					Name:       fmt.Sprintf("cahook:%s", hook.Name),
+					Err:        err.Error(),
+					DurationMs: time.Since(startTime).Milliseconds(),
+				},
+			})
+		}
 		return // analysis failed, skip silently
 	}
 
 	// Step 4: Write to tmp file
 	tmpFile, err := WriteTmp(response)
 	if err != nil {
+		// Debug: emit error result
+		if m.debug && m.sink != nil {
+			m.sink.Emit(event.Event{
+				Kind: event.ToolResult,
+				Tool: event.Tool{
+					ID:         fmt.Sprintf("cahook-%s-%d", hook.Name, state.Turn),
+					Name:       fmt.Sprintf("cahook:%s", hook.Name),
+					Err:        err.Error(),
+					DurationMs: time.Since(startTime).Milliseconds(),
+				},
+			})
+		}
 		return
 	}
 	defer CleanupTmp(tmpFile)
@@ -135,6 +176,19 @@ func (m *Manager) runOne(ctx context.Context, hook HookConfig, state State, sess
 			analysis = map[string]any{"raw": response}
 		}
 		WriteInsight(hook.Output.Dir, hook.Output.File, payload.SessionID, hook.Name, state.Turn, analysis)
+	}
+
+	// Debug: emit success result
+	if m.debug && m.sink != nil {
+		m.sink.Emit(event.Event{
+			Kind: event.ToolResult,
+			Tool: event.Tool{
+				ID:         fmt.Sprintf("cahook-%s-%d", hook.Name, state.Turn),
+				Name:       fmt.Sprintf("cahook:%s", hook.Name),
+				Output:     fmt.Sprintf("insight written to %s/%s", hook.Output.Dir, hook.Output.File),
+				DurationMs: time.Since(startTime).Milliseconds(),
+			},
+		})
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 // Config is the top-level cahooks configuration, loaded from .reasonix/cahooks.json.
 type Config struct {
 	Hooks []HookConfig `json:"hooks"`
+	Debug bool         `json:"debug,omitempty"`
 }
 
 // HookConfig defines one context analysis hook.
