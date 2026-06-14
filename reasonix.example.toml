@@ -122,6 +122,7 @@ bash_timeout_seconds = 120   # foreground safety cap; set 0 for no tool-local ca
 # enabled      = false
 # auto_install = true
 # path         = ""   # empty = cache, then PATH, then a bundle beside reasonix
+# project_root = ""   # optional: where .codegraph/ lives (for multi-dir setups)
 
 # Skills are invokable playbooks (SKILL.md / <name>.md with frontmatter), found
 # under .reasonix/skills, .agents/skills, .agent/skills, .claude/skills (project)

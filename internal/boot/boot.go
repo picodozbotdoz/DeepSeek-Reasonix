@@ -304,8 +304,15 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 				// priority keeps it from starving the user's machine (#3797).
 				LowPriority: true,
 			}
-			warm := codegraph.Initialized(root)
-			if err := codegraph.EnsureInit(ctx, bin, root); err != nil {
+			if cfg.Codegraph.ProjectRoot != "" {
+				spec.Args = append(spec.Args, "--path", cfg.Codegraph.ProjectRoot)
+			}
+			initRoot := root
+			if cfg.Codegraph.ProjectRoot != "" {
+				initRoot = cfg.Codegraph.ProjectRoot
+			}
+			warm := codegraph.Initialized(initRoot)
+			if err := codegraph.EnsureInit(ctx, bin, initRoot); err != nil {
 				sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn,
 					Text: "codegraph: init failed (" + err.Error() + ") — symbol-graph tools disabled this session"})
 				break
@@ -775,10 +782,14 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 				if !ok {
 					return "", fmt.Errorf("codegraph is not installed")
 				}
-				if !codegraph.IndexableRoot(root) {
+				initRoot := root
+				if cfg.Codegraph.ProjectRoot != "" {
+					initRoot = cfg.Codegraph.ProjectRoot
+				}
+				if !codegraph.IndexableRoot(initRoot) {
 					return "", fmt.Errorf("codegraph: project root is a filesystem root — skipped to avoid indexing the whole volume")
 				}
-				if err := codegraph.EnsureInit(ctx, bin, root); err != nil {
+				if err := codegraph.EnsureInit(ctx, bin, initRoot); err != nil {
 					return "", fmt.Errorf("codegraph init: %w", err)
 				}
 				spec := plugin.Spec{
@@ -789,6 +800,9 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 					Dir:               root,
 					ReadOnlyToolNames: codegraph.ReadOnlyToolNames(),
 					LowPriority:       true,
+				}
+				if cfg.Codegraph.ProjectRoot != "" {
+					spec.Args = append(spec.Args, "--path", cfg.Codegraph.ProjectRoot)
 				}
 				if opts.Stderr != nil {
 					spec.Stderr = opts.Stderr

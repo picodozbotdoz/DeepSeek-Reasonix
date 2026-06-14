@@ -294,6 +294,11 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 	} else {
 		b.WriteString("# path       = \"\"   # empty = cache, then PATH, then a bundle beside reasonix\n")
 	}
+	if c.Codegraph.ProjectRoot != "" {
+		fmt.Fprintf(&b, "project_root = %q   # where .codegraph/ lives (for multi-dir setups)\n", c.Codegraph.ProjectRoot)
+	} else {
+		b.WriteString("# project_root = \"\"   # optional: where .codegraph/ lives (for multi-dir setups)\n")
+	}
 	b.WriteString("\n")
 
 	b.WriteString("[builtin_mcp]\n")

@@ -465,6 +465,7 @@ type CodegraphConfig struct {
 	AutoInstall bool   `toml:"auto_install"`
 	Path        string `toml:"path"`
 	Tier        string `toml:"tier"`
+	ProjectRoot string `toml:"project_root"`
 }
 
 func (c CodegraphConfig) ShouldAutoStart() bool {
