@@ -2052,6 +2052,67 @@ func waitForMCPFailure(t *testing.T, h *plugin.Host, name string, timeout time.D
 	}
 }
 
+func TestBuildClarifyModelResolvesProvider(t *testing.T) {
+	isolateConfigHome(t)
+	dir := robustTempDir(t)
+	t.Chdir(dir)
+
+	writeFile(t, dir, "reasonix.toml", `
+default_model = "test-model"
+
+[codegraph]
+enabled = false
+
+[agent]
+system_prompt = "TEST"
+clarify_model = "test-model"
+
+[[providers]]
+name = "test-model"
+kind = "openai"
+base_url = "https://example.invalid"
+model = "x"
+api_key_env = "REASONIX_TEST_KEY_UNSET"
+`)
+
+	ctrl, err := Build(context.Background(), Options{})
+	if err != nil {
+		t.Fatalf("Build with valid clarify_model should succeed: %v", err)
+	}
+	defer ctrl.Close()
+}
+
+func TestBuildClarifyModelInvalidDoesNotFail(t *testing.T) {
+	isolateConfigHome(t)
+	dir := robustTempDir(t)
+	t.Chdir(dir)
+
+	writeFile(t, dir, "reasonix.toml", `
+default_model = "test-model"
+
+[codegraph]
+enabled = false
+
+[agent]
+system_prompt = "TEST"
+clarify_model = "nonexistent-model"
+
+[[providers]]
+name = "test-model"
+kind = "openai"
+base_url = "https://example.invalid"
+model = "x"
+api_key_env = "REASONIX_TEST_KEY_UNSET"
+`)
+
+	// An invalid clarify_model should warn but NOT fail the build.
+	ctrl, err := Build(context.Background(), Options{})
+	if err != nil {
+		t.Fatalf("Build with invalid clarify_model should warn but not fail: %v", err)
+	}
+	defer ctrl.Close()
+}
+
 // TestHelperProcess is invoked as a subprocess by TestBuildEagerStartsAtBoot
 // and TestBuildLazyDoesNotConnectAtBoot. It mirrors the minimal MCP stdio
 // server in internal/plugin/plugin_test.go so the boot package can drive an

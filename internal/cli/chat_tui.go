@@ -1299,9 +1299,9 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// The first element is always the original; remaining are refinements.
 		for i, v := range msg.versions {
-			label := i18n.M.ClarifyRefinedFmt
-			if i == 0 {
-				label = i18n.M.ClarifyOriginalLabel
+			label := i18n.M.ClarifyOriginalLabel
+			if i > 0 {
+				label = fmt.Sprintf(i18n.M.ClarifyRefinedFmt, i)
 			}
 			m.clarifyPicker.options = append(m.clarifyPicker.options, clarifyOption{
 				index: i, text: v, label: label,

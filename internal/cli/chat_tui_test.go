@@ -2027,3 +2027,175 @@ func TestShiftTabStillTogglesPlanUnderClassicShortcutLayout(t *testing.T) {
 		t.Fatalf("Shift+Tab changed approval mode to %q", got)
 	}
 }
+
+func TestCtrlKWithTextOpensClarifyPicker(t *testing.T) {
+	m := newTestChatTUI()
+	m.input.SetValue("refactor the auth module")
+	m.ctrl = control.New(control.Options{})
+
+	out, _ := m.Update(tea.KeyPressMsg{Code: 'k', Mod: tea.ModCtrl})
+	m2 := out.(chatTUI)
+
+	if m2.clarifyPicker == nil {
+		t.Fatal("Ctrl+K should open clarifyPicker")
+	}
+	if !m2.clarifyPicker.loading {
+		t.Fatal("clarifyPicker should show loading")
+	}
+	if m2.clarifyPicker.pending != "refactor the auth module" {
+		t.Fatalf("clarifyPicker.pending = %q, want original text", m2.clarifyPicker.pending)
+	}
+	if len(m2.clarifyPicker.options) != 1 {
+		t.Fatalf("expected 1 option (original), got %d", len(m2.clarifyPicker.options))
+	}
+}
+
+func TestCtrlKWithEmptyTextShowsNotice(t *testing.T) {
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{})
+
+	out, _ := m.Update(tea.KeyPressMsg{Code: 'k', Mod: tea.ModCtrl})
+	m2 := out.(chatTUI)
+
+	if m2.clarifyPicker != nil {
+		t.Fatal("Ctrl+K on empty input should NOT open clarifyPicker")
+	}
+}
+
+func TestCtrlKWhileRunningIsIgnored(t *testing.T) {
+	m := newTestChatTUI()
+	m.state = tuiRunning
+	m.input.SetValue("some text")
+	m.ctrl = control.New(control.Options{})
+
+	out, _ := m.Update(tea.KeyPressMsg{Code: 'k', Mod: tea.ModCtrl})
+	m2 := out.(chatTUI)
+
+	if m2.clarifyPicker != nil {
+		t.Fatal("Ctrl+K while running should be ignored")
+	}
+}
+
+func TestClarifyPickerEscDuringLoadingCancels(t *testing.T) {
+	m := newTestChatTUI()
+	m.input.SetValue("original text")
+	m.clarifyPicker = &clarifyPicker{
+		options: []clarifyOption{{index: 0, text: "original text", label: "Original"}},
+		sel:     0,
+		loading: true,
+		pending: "original text",
+	}
+
+	out, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m2 := out.(chatTUI)
+
+	if m2.clarifyPicker != nil {
+		t.Fatal("Esc during loading should cancel clarifyPicker")
+	}
+	if m2.input.Value() != "original text" {
+		t.Fatalf("input should be restored to original, got %q", m2.input.Value())
+	}
+}
+
+func TestClarifyPickerEnterSelectsOption(t *testing.T) {
+	m := newTestChatTUI()
+	m.input.SetValue("original text")
+	m.clarifyPicker = &clarifyPicker{
+		options: []clarifyOption{
+			{index: 0, text: "original text", label: "Original"},
+			{index: 1, text: "refined version 1", label: "Refined 1"},
+		},
+		sel:     1,
+		pending: "original text",
+	}
+
+	out, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m2 := out.(chatTUI)
+
+	if m2.clarifyPicker != nil {
+		t.Fatal("Enter should close clarifyPicker")
+	}
+	if m2.input.Value() != "refined version 1" {
+		t.Fatalf("input should be set to selected option, got %q", m2.input.Value())
+	}
+}
+
+func TestClarifyPickerEscAfterLoadingRestoresOriginal(t *testing.T) {
+	m := newTestChatTUI()
+	m.input.SetValue("original text")
+	m.clarifyPicker = &clarifyPicker{
+		options: []clarifyOption{
+			{index: 0, text: "original text", label: "Original"},
+			{index: 1, text: "refined version", label: "Refined 1"},
+		},
+		sel:     1,
+		pending: "original text",
+	}
+
+	out, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m2 := out.(chatTUI)
+
+	if m2.clarifyPicker != nil {
+		t.Fatal("Esc should close clarifyPicker")
+	}
+	if m2.input.Value() != "original text" {
+		t.Fatalf("input should be restored to original, got %q", m2.input.Value())
+	}
+}
+
+func TestClarifyResultMsgPopulatesOptions(t *testing.T) {
+	m := newTestChatTUI()
+	m.input.SetValue("my prompt")
+	m.clarifyPicker = &clarifyPicker{
+		options: []clarifyOption{
+			{index: 0, text: "my prompt", label: "Original"},
+		},
+		sel:     0,
+		loading: true,
+		pending: "my prompt",
+	}
+
+	out, _ := m.Update(clarifyResultMsg{
+		versions: []string{"my prompt", "version A", "version B"},
+	})
+	m2 := out.(chatTUI)
+
+	if m2.clarifyPicker == nil {
+		t.Fatal("clarifyPicker should still exist after result")
+	}
+	if m2.clarifyPicker.loading {
+		t.Fatal("clarifyPicker should no longer be loading")
+	}
+	// versions[0] is the original (already in options as "Original"),
+	// so we get the original option appended as "Refined 0" too.
+	// Total: pre-existing Original + 3 from versions = 4 options.
+	if len(m2.clarifyPicker.options) != 4 {
+		t.Fatalf("expected 4 options, got %d", len(m2.clarifyPicker.options))
+	}
+}
+
+func TestClarifyResultMsgErrorClearsPicker(t *testing.T) {
+	m := newTestChatTUI()
+	m.input.SetValue("my prompt")
+	m.clarifyPicker = &clarifyPicker{
+		options: []clarifyOption{
+			{index: 0, text: "my prompt", label: "Original"},
+		},
+		sel:     0,
+		loading: true,
+		pending: "my prompt",
+	}
+
+	out, _ := m.Update(clarifyResultMsg{
+		err: assertAnError("mock error"),
+	})
+	m2 := out.(chatTUI)
+
+	if m2.clarifyPicker != nil {
+		t.Fatal("clarifyPicker should be cleared on error")
+	}
+}
+
+type assertAnError string
+
+func (e assertAnError) Error() string { return string(e) }
