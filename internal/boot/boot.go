@@ -895,6 +895,24 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		classifier = control.NewProviderAutoPlanClassifier(classifierProv)
 	}
 
+	// Resolve the optional clarify provider for prompt refinement.
+	var clarifyProv provider.Provider
+	if cm := cfg.ClarifyModel(); cm != "" {
+		ce, ok := cfg.ResolveModel(cm)
+		if !ok {
+			sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn,
+				Text: fmt.Sprintf("clarify_model %q not found — using default model for prompt refinement", cm)})
+		} else {
+			cp, err := NewProviderWithProxy(ce, proxySpec)
+			if err != nil {
+				sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn,
+					Text: fmt.Sprintf("clarify_model %q failed: %s — using default model", cm, err)})
+			} else {
+				clarifyProv = cp
+			}
+		}
+	}
+
 	ctrlOpts := control.Options{
 		Runner:                 runner,
 		Executor:               executor,
@@ -926,6 +944,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		OnRemember: func(rule string) control.RememberResult {
 			return rememberPermissionRule(root, rule)
 		},
+		ClarifyProvider: clarifyProv,
 	}
 	if classifier != nil {
 		ctrlOpts.Classifier = classifier

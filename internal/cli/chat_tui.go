@@ -300,6 +300,9 @@ type chatTUI struct {
 	// fileSearchCache memoizes fileref.Search by query so the bounded walk runs
 	// once per @token fragment, not on every keystroke that re-renders the menu.
 	fileSearchCache map[string][]string
+
+	// clarifyPicker is the prompt refinement overlay (nil when closed).
+	clarifyPicker *clarifyPicker
 }
 
 type tuiState int
@@ -336,6 +339,28 @@ type statuslineMsg struct{ out string }
 // gitStatusMsg carries the latest lightweight git readout for the built-in
 // status line. Empty means "not a git worktree" or "git unavailable".
 type gitStatusMsg struct{ status gitStatus }
+
+// clarifyResultMsg carries the result of an async prompt refinement call.
+type clarifyResultMsg struct {
+	versions []string
+	err      error
+}
+
+// clarifyOption is one option shown in the clarify picker overlay.
+type clarifyOption struct {
+	index int
+	text  string
+	label string // "Original" or "Refined 1", etc.
+}
+
+// clarifyPicker is the modal overlay for choosing a refined prompt.
+type clarifyPicker struct {
+	options []clarifyOption
+	sel     int
+	loading bool
+	err     string
+	pending string // the original text being refined
+}
 
 // runStatusline runs the user's custom status-line command off the event loop,
 // feeding it a small JSON context on stdin and returning its first stdout line.
@@ -879,6 +904,10 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.rewind != nil {
 			return m.handleRewindKey(msg)
 		}
+		// The clarify picker is modal while open: keys navigate it.
+		if m.clarifyPicker != nil {
+			return m.handleClarifyKey(msg)
+		}
 		// The MCP import picker is modal while open: keys select candidates.
 		if m.mcpImport != nil {
 			return m.handleMCPImportKey(msg)
@@ -1061,6 +1090,19 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+b":
 			m.toggleShellOutput()
 			return m, finalize(m, cmds)
+		case "ctrl+k":
+			if m.state == tuiRunning {
+				return m, nil // ignore while a turn is running
+			}
+			if m.clarifyPicker != nil {
+				return m, nil // already in the picker
+			}
+			text := m.input.Value()
+			if strings.TrimSpace(text) == "" {
+				m.notice(i18n.M.ClarifyEmpty)
+				return m, nil
+			}
+			return m, m.startClarify(text, "")
 		case "shift+tab":
 			// Shift+Tab toggles Plan only. Tool approval stays on its own axis:
 			// Ask/Auto are explicit choices, and YOLO is a separate Ctrl+Y toggle.
@@ -1147,6 +1189,17 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Slash commands run locally without going through the model. A
 			// '/'-leading line that's actually a dragged file path is an attachment,
 			// not a command, so it's rewritten to an @reference instead.
+			if strings.HasPrefix(line, "/clarify") {
+				m.input.Reset()
+				m.pastedBlocks = nil
+				target := strings.TrimSpace(strings.TrimPrefix(line, "/clarify"))
+				if target == "" {
+					m.notice(i18n.M.ClarifyUsage)
+					return m, finalize(m, cmds)
+				}
+				cmds = append(cmds, m.startClarify(target, ""))
+				return m, finalize(m, cmds)
+			}
 			if strings.HasPrefix(line, "//") {
 				// Double-slash — common in JS comments, file:// URLs, etc.
 				// Not a command. Fall through to normal message path.
@@ -1233,6 +1286,28 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case gitStatusMsg:
 		m.gitStatus = msg.status
+
+	case clarifyResultMsg:
+		if m.clarifyPicker == nil {
+			break
+		}
+		m.clarifyPicker.loading = false
+		if msg.err != nil {
+			m.clarifyPicker = nil
+			m.notice(fmt.Sprintf(i18n.M.ClarifyFailedFmt, msg.err.Error()))
+			break
+		}
+		// The first element is always the original; remaining are refinements.
+		for i, v := range msg.versions {
+			label := i18n.M.ClarifyRefinedFmt
+			if i == 0 {
+				label = i18n.M.ClarifyOriginalLabel
+			}
+			m.clarifyPicker.options = append(m.clarifyPicker.options, clarifyOption{
+				index: i, text: v, label: label,
+			})
+		}
+		m.clarifyPicker.sel = 0
 
 	case compactDoneMsg:
 		if msg.err != nil {
@@ -2200,6 +2275,12 @@ func (m chatTUI) View() tea.View {
 	switch {
 	case m.rewind != nil:
 		status = "  " + modeTag + " · ⟲ rewind"
+	case m.clarifyPicker != nil:
+		if m.clarifyPicker.loading {
+			status = "  " + modeTag + " · " + i18n.M.ClarifyWorking
+		} else {
+			status = "  " + modeTag + " · " + i18n.M.ClarifyTitle
+		}
 	case m.mcpImport != nil:
 		status = "  " + modeTag + " · MCP import"
 	case m.resumePick != nil:
@@ -2293,6 +2374,10 @@ func (m chatTUI) View() tea.View {
 		rowsAboveBox += strings.Count(card, "\n") + 1
 	}
 	if card := m.renderRewind(); card != "" {
+		parts = append(parts, card)
+		rowsAboveBox += strings.Count(card, "\n") + 1
+	}
+	if card := m.renderClarifyPicker(); card != "" {
 		parts = append(parts, card)
 		rowsAboveBox += strings.Count(card, "\n") + 1
 	}
@@ -3165,6 +3250,94 @@ func (m *chatTUI) toggleVerboseReasoning(notify bool) {
 // shows, and `restore` is what Esc puts back while the bubble is still deferred.
 func (m *chatTUI) startTurn(sent, displayed, restore string) tea.Cmd {
 	return m.startTurnWithRaw(sent, displayed, restore, sent)
+}
+
+// startClarify kicks off an async prompt refinement and shows a loading overlay.
+func (m *chatTUI) startClarify(text, hint string) tea.Cmd {
+	m.clarifyPicker = &clarifyPicker{
+		options: []clarifyOption{
+			{index: 0, text: text, label: i18n.M.ClarifyOriginalLabel},
+		},
+		sel:     0,
+		loading: true,
+		pending: text,
+	}
+	// Run the refinement in a goroutine, send result as tea.Msg
+	return func() tea.Msg {
+		versions, err := m.ctrl.ClarifyPrompt(context.Background(), text)
+		if err != nil {
+			return clarifyResultMsg{err: err}
+		}
+		return clarifyResultMsg{versions: versions}
+	}
+}
+
+// handleClarifyKey processes key events while the clarify picker is open.
+func (m chatTUI) handleClarifyKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.clarifyPicker.loading {
+		// Still loading — only Esc works to cancel.
+		if msg.String() == "esc" {
+			orig := m.clarifyPicker.pending
+			m.clarifyPicker = nil
+			m.input.SetValue(orig)
+			m.growInputToFit()
+			m.notice(i18n.M.ClarifyCancelled)
+		}
+		return m, finalize(m, nil)
+	}
+	switch msg.String() {
+	case "up", "shift+tab":
+		if m.clarifyPicker.sel > 0 {
+			m.clarifyPicker.sel--
+		}
+	case "down", "tab":
+		if m.clarifyPicker.sel < len(m.clarifyPicker.options)-1 {
+			m.clarifyPicker.sel++
+		}
+	case "enter":
+		chosen := m.clarifyPicker.options[m.clarifyPicker.sel].text
+		m.clarifyPicker = nil
+		m.input.SetValue(chosen)
+		m.growInputToFit()
+		m.notice(i18n.M.ClarifySelected)
+		return m, finalize(m, nil)
+	case "esc":
+		orig := m.clarifyPicker.pending
+		m.clarifyPicker = nil
+		m.input.SetValue(orig)
+		m.growInputToFit()
+		m.notice(i18n.M.ClarifyCancelled)
+	}
+	return m, finalize(m, nil)
+}
+
+// renderClarifyPicker draws the clarify picker overlay, or "" when no picker is open.
+func (m chatTUI) renderClarifyPicker() string {
+	p := m.clarifyPicker
+	if p == nil {
+		return ""
+	}
+	w := max(m.width, 10)
+	var b strings.Builder
+
+	if p.loading {
+		b.WriteString(accent(i18n.M.ClarifyTitle) + "\n")
+		b.WriteString(dim(i18n.M.ClarifyWorking))
+		return choicePanelStyle.Width(w).Render(b.String())
+	}
+
+	b.WriteString(accent(i18n.M.ClarifyTitle) + "\n")
+	b.WriteString(dim(i18n.M.ClarifyHint) + "\n")
+	for i, opt := range p.options {
+		// Show the label and a one-line preview of the text
+		preview := opt.text
+		if len([]rune(preview)) > w-6 {
+			preview = string([]rune(preview)[:w-9]) + "..."
+		}
+		b.WriteString(rowLine(i == p.sel, i+1, "", opt.label+": "+preview, false) + "\n")
+	}
+	b.WriteString(dim(i18n.M.ClarifyHint))
+	return choicePanelStyle.Width(w).Render(b.String())
 }
 
 // startTurnWithRaw is startTurn plus an explicit `raw` (the un-resolved user

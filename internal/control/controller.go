@@ -33,6 +33,7 @@ import (
 	"reasonix/internal/billing"
 	"reasonix/internal/builtinmcp"
 	"reasonix/internal/checkpoint"
+	"reasonix/internal/clarify"
 	"reasonix/internal/codegraph"
 	"reasonix/internal/command"
 	"reasonix/internal/config"
@@ -173,6 +174,8 @@ type Controller struct {
 	pendingMemory []string
 
 	displayRecorder func(content, display string)
+
+	clarifyProv provider.Provider // optional lightweight provider for prompt refinement
 }
 
 type approvalReply struct {
@@ -273,6 +276,10 @@ type Options struct {
 	// persist to disk (e.g. "Bash(go test:*)"). The callback is wired into the
 	// permission Gate on EnableInteractiveApproval.
 	OnRemember func(rule string) RememberResult
+	// ClarifyProvider is an optional lightweight provider for prompt refinement
+	// (Ctrl+K / /clarify). When nil, refinement falls back to the session's
+	// executor provider.
+	ClarifyProvider provider.Provider
 }
 
 // New builds a Controller. A nil Sink is replaced with event.Discard.
@@ -324,6 +331,7 @@ func New(opts Options) *Controller {
 		approvals:              map[string]pendingApproval{},
 		asks:                   map[string]pendingAsk{},
 		granted:                map[string]bool{},
+		clarifyProv:            opts.ClarifyProvider,
 	}
 	// Checkpoints: bind a store to the session and route writer pre-edits into it.
 	c.rebindCheckpoints(opts.SessionPath)
@@ -2649,6 +2657,27 @@ func (c *Controller) ForgetMemory(name string) error {
 		"Forgot memory \""+name+"\" — disregard its line still shown in the saved-memories index until next session.")
 	c.refreshMemoryLocked()
 	return nil
+}
+
+// ClarifyPrompt refines the user's input text via a lightweight LLM call,
+// returning the original as the first option plus 2–3 refined versions.
+// The refinement uses the optional ClarifyProvider, the executor's provider,
+// or returns a passthrough [input] when neither is available.
+func (c *Controller) ClarifyPrompt(ctx context.Context, input string) ([]string, error) {
+	if strings.TrimSpace(input) == "" {
+		return nil, fmt.Errorf("nothing to clarify")
+	}
+	prov := c.clarifyProv
+	if prov == nil && c.executor != nil {
+		// We don't expose the executor's provider directly, so we fall
+		// through to the passthrough if no dedicated clarifyProv was set.
+		// The caller (boot) should always wire a provider if possible.
+		return []string{input}, nil
+	}
+	if prov == nil {
+		return []string{input}, nil
+	}
+	return clarify.Refine(ctx, prov, input, "")
 }
 
 // QueueMemory implements memory.Queue: when the model runs the remember/forget

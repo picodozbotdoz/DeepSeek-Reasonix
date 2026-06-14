@@ -404,6 +404,18 @@ type Messages struct {
 
 	// usage / help
 	UsageBody string // full multi-line help text
+
+	// clarify — prompt refinement (Ctrl+K / /clarify)
+	ClarifyTitle          string // header: "Prompt Refinement"
+	ClarifyHint           string // keyboard hint
+	ClarifyOriginalLabel  string // "Original"
+	ClarifyRefinedFmt     string // "Refined %d" format with an integer argument
+	ClarifyEmpty          string // "nothing to clarify"
+	ClarifyFailedFmt      string // "clarify failed: %s" — %s = error
+	ClarifyCancelled      string // "using original"
+	ClarifyUsage          string // /clarify usage syntax
+	ClarifyWorking        string // "refining prompt…"
+	ClarifySelected       string // "refined prompt selected — press Enter to submit"
 }
 
 // ProviderStatusMessage returns an actionable explanation for a known provider

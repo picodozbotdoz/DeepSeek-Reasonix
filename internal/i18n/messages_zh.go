@@ -391,4 +391,15 @@ var Chinese = Messages{
   密钥通过 api_key_env 从环境变量注入（如 DEEPSEEK_API_KEY）。
   运行 'reasonix setup' 生成配置；详见 docs/SPEC.md。
 `,
+
+	ClarifyTitle:         "提示词优化",
+	ClarifyHint:          "↑/↓ 选择 · Enter 确认 · Esc 保留原样",
+	ClarifyOriginalLabel: "原始",
+	ClarifyRefinedFmt:    "优化 %d",
+	ClarifyEmpty:         "没有可优化的内容——请先输入提示词",
+	ClarifyFailedFmt:     "优化失败：%s",
+	ClarifyCancelled:     "已取消，使用原始提示词",
+	ClarifyUsage:         "用法：/clarify <要优化的内容>  或 输入提示词后按 Ctrl+K",
+	ClarifyWorking:       "正在优化…",
+	ClarifySelected:      "已选择优化版本，按 Enter 提交",
 }

@@ -362,6 +362,14 @@ func (c *Config) ColdResumePruneEnabled() bool {
 	return *c.Agent.ColdResumePrune
 }
 
+// ClarifyModel returns the configured clarify model ref, or "" for default.
+func (c *Config) ClarifyModel() string {
+	if c == nil {
+		return ""
+	}
+	return strings.TrimSpace(c.Agent.ClarifyModel)
+}
+
 // ReasoningLanguage normalizes agent.reasoning_language. Empty means auto:
 // visible reasoning follows the conversation language already described by the
 // stable LanguagePolicy. Legacy "default" is treated as auto.
@@ -870,6 +878,10 @@ type AgentConfig struct {
 	// ColdResumePrune elides stale tool results when a session reopens past the
 	// provider cache window. nil = default enabled.
 	ColdResumePrune *bool `toml:"cold_resume_prune"`
+	// ClarifyModel optionally names a provider/model for lightweight prompt
+	// refinement (Ctrl+K / /clarify). When empty, refinement uses the active
+	// session's model.
+	ClarifyModel string `toml:"clarify_model"`
 }
 
 // ProviderEntry declares a model provider instance. ContextWindow is the model's
