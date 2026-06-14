@@ -393,13 +393,13 @@ var Chinese = Messages{
 `,
 
 	ClarifyTitle:         "提示词优化",
-	ClarifyHint:          "↑/↓ 选择 · Enter 确认 · Esc 保留原样",
+	ClarifyHint:          "↑/↓ 选择 · Enter 确认 · Ctrl+V 展开 · Esc 保留原样",
 	ClarifyOriginalLabel: "原始",
 	ClarifyRefinedFmt:    "优化 %d",
 	ClarifyEmpty:         "没有可优化的内容——请先输入提示词",
 	ClarifyFailedFmt:     "优化失败：%s",
 	ClarifyCancelled:     "已取消，使用原始提示词",
-	ClarifyUsage:         "用法：/clarify <要优化的内容>  或 输入提示词后按 Ctrl+K",
+	ClarifyUsage:         "用法：/clarify [--context] <内容>  或 输入提示词后按 Ctrl+K（Alt+K 使用上下文）",
 	ClarifyWorking:       "正在优化…",
 	ClarifySelected:      "已选择优化版本，按 Enter 提交",
 }

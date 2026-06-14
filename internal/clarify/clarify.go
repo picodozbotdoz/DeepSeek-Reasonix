@@ -19,7 +19,27 @@ const DefaultVersions = 3
 // DefaultMaxTokens is the default max output tokens for a refinement call.
 const DefaultMaxTokens = 1024
 
-// SystemPromptFmt is a format string for the refinement system prompt.
+// SystemPromptContextualFmt is a format string for the context-aware
+// refinement system prompt. It tells the model to analyze the conversation
+// history and ignore tool-calling patterns in assistant responses.
+const SystemPromptContextualFmt = `You are a prompt refinement assistant analyzing a conversation between a user and a coding agent called Reasonix.
+
+Below is the conversation history. IGNORE any tool call syntax, function calls, or structured data blocks in the assistant responses — they are internal agent operations and not relevant to the user's request. Focus only on the user's questions and the conversational context.
+
+The user's latest draft prompt is at the end (after "Draft:"). Your job is to produce %d improved versions of this draft.
+
+Consider:
+- Making vague requests concrete
+- Breaking multi-part asks into clear steps
+- Incorporating relevant context from the conversation history
+- Keeping the user's original intent and voice
+
+Output exactly %d versions, each on a line starting with "VERSION:" followed by the text.
+Do not include numbering, markdown, tool calls, or extra commentary — just the VERSION: lines.
+Example:
+VERSION: Refactor the authentication handler in internal/auth/ to use the new JWT library. Update the signing key rotation logic and add tests.
+VERSION: Update the auth package to use the new JWT library: rewrite handler.go, update key rotation, and add unit tests covering the new flow.
+`
 // The %d placeholder is replaced with the desired number of versions.
 const SystemPromptFmt = `You are a prompt refinement assistant for a coding agent called Reasonix.
 The user has written a draft prompt for the agent. Your job is to produce %d improved versions.
@@ -43,7 +63,7 @@ var SystemPrompt = fmt.Sprintf(SystemPromptFmt, DefaultVersions, DefaultVersions
 
 // Refine calls the provider to generate prompt refinements (backward-
 // compatible alias — delegates to RefineFresh with defaults).
-func Refine(ctx context.Context, prov provider.Provider, input, focusHint string) ([]string, error) {
+func Refine(ctx context.Context, prov provider.Provider, input, focusHint string) ([]string, *provider.Usage, error) {
 	return RefineFresh(ctx, prov, input, nil, focusHint, "", "", 0, nil, DefaultVersions, DefaultMaxTokens)
 }
 
@@ -90,9 +110,9 @@ func buildUserMessage(instruction string, toolNames []string, history string, in
 //	[instruction]           — fixed, cached ("" = no-op)
 //	[history(maxPairs)]     — variable content, fixed size; cache miss on content change
 //	[Draft:\n + input]      — fixed prefix "Draft:\n" cached; input varies
-func RefineFresh(ctx context.Context, prov provider.Provider, input string, history []provider.Message, focusHint, sysPrompt, instruction string, maxPairs int, toolNames []string, maxVersions, maxTokens int) ([]string, error) {
+func RefineFresh(ctx context.Context, prov provider.Provider, input string, history []provider.Message, focusHint, sysPrompt, instruction string, maxPairs int, toolNames []string, maxVersions, maxTokens int) ([]string, *provider.Usage, error) {
 	if strings.TrimSpace(input) == "" {
-		return nil, fmt.Errorf("cannot clarify empty input")
+		return nil, nil, fmt.Errorf("cannot clarify empty input")
 	}
 
 	userMsg := buildUserMessage(instruction, toolNames, formatHistory(history, maxPairs), input, focusHint)
@@ -131,9 +151,9 @@ func RefineFresh(ctx context.Context, prov provider.Provider, input string, hist
 //
 // sessionMsgs should already be filtered (no RoleTool messages).
 // The draft is appended as the last user message with "Draft:\n" prefix.
-func RefineContextual(ctx context.Context, prov provider.Provider, input string, sessionMsgs []provider.Message, focusHint, sysPrompt, instruction string, toolNames []string, maxVersions, maxTokens int) ([]string, error) {
+func RefineContextual(ctx context.Context, prov provider.Provider, input string, sessionMsgs []provider.Message, focusHint, sysPrompt, instruction string, toolNames []string, maxVersions, maxTokens int) ([]string, *provider.Usage, error) {
 	if strings.TrimSpace(input) == "" {
-		return nil, fmt.Errorf("cannot clarify empty input")
+		return nil, nil, fmt.Errorf("cannot clarify empty input")
 	}
 
 	sys := sysPrompt
@@ -142,7 +162,7 @@ func RefineContextual(ctx context.Context, prov provider.Provider, input string,
 		if versions <= 0 {
 			versions = DefaultVersions
 		}
-		sys = fmt.Sprintf(SystemPromptFmt, versions, versions)
+		sys = fmt.Sprintf(SystemPromptContextualFmt, versions, versions)
 	}
 
 	tok := maxTokens
@@ -168,11 +188,17 @@ func RefineContextual(ctx context.Context, prov provider.Provider, input string,
 	}
 
 	// Add the filtered session messages (user + assistant turns).
+	// Tool calls are stripped from assistant messages — only text content
+	// provides useful context; DSML/function-call syntax confuses the model.
 	for _, m := range sessionMsgs {
 		if m.Role == provider.RoleTool {
 			continue
 		}
-		msgs = append(msgs, m)
+		cleaned := m
+		if cleaned.Role == provider.RoleAssistant {
+			cleaned.ToolCalls = nil
+		}
+		msgs = append(msgs, cleaned)
 	}
 
 	// Append the draft as the final user message.
@@ -193,21 +219,23 @@ func RefineContextual(ctx context.Context, prov provider.Provider, input string,
 }
 
 // refineCall sends the request, streams the response, and parses VERSION: lines.
-func refineCall(ctx context.Context, prov provider.Provider, req provider.Request, originalInput string, maxVersions int) ([]string, error) {
+// It returns the versions (original + refinements), token usage, and any error.
+func refineCall(ctx context.Context, prov provider.Provider, req provider.Request, originalInput string, maxVersions int) ([]string, *provider.Usage, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
 	ch, err := prov.Stream(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("clarify: stream: %w", err)
+		return nil, nil, fmt.Errorf("clarify: stream: %w", err)
 	}
 
 	var sb strings.Builder
+	var usage *provider.Usage
 loop:
 	for {
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("clarify: %w", ctx.Err())
+			return nil, usage, fmt.Errorf("clarify: %w", ctx.Err())
 		case chunk, ok := <-ch:
 			if !ok {
 				break loop
@@ -216,8 +244,10 @@ loop:
 			case provider.ChunkText:
 				sb.WriteString(chunk.Text)
 			case provider.ChunkError:
-				return nil, fmt.Errorf("clarify: %w", chunk.Err)
+				return nil, usage, fmt.Errorf("clarify: %w", chunk.Err)
 			case provider.ChunkToolCallStart, provider.ChunkToolCall:
+			case provider.ChunkUsage:
+				usage = chunk.Usage
 			}
 		}
 	}
@@ -226,12 +256,12 @@ loop:
 	if len(versions) == 0 {
 		trimmed := strings.TrimSpace(sb.String())
 		if trimmed != "" {
-			return []string{originalInput, trimmed}, nil
+			return []string{originalInput, trimmed}, usage, nil
 		}
-		return []string{originalInput}, nil
+		return []string{originalInput}, usage, nil
 	}
 
-	return append([]string{originalInput}, versions...), nil
+	return append([]string{originalInput}, versions...), usage, nil
 }
 
 // formatHistory formats session messages into compact user/assistant pairs,

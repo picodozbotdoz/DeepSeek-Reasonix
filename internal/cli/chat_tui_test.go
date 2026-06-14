@@ -2166,11 +2166,10 @@ func TestClarifyResultMsgPopulatesOptions(t *testing.T) {
 	if m2.clarifyPicker.loading {
 		t.Fatal("clarifyPicker should no longer be loading")
 	}
-	// versions[0] is the original (already in options as "Original"),
-	// so we get the original option appended as "Refined 0" too.
-	// Total: pre-existing Original + 3 from versions = 4 options.
-	if len(m2.clarifyPicker.options) != 4 {
-		t.Fatalf("expected 4 options, got %d", len(m2.clarifyPicker.options))
+	// versions[0] is the original, versions[1..] are refinements.
+	// Total: 3 options (Original + 2 refinements).
+	if len(m2.clarifyPicker.options) != 3 {
+		t.Fatalf("expected 3 options, got %d", len(m2.clarifyPicker.options))
 	}
 }
 

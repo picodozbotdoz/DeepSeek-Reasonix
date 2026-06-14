@@ -871,7 +871,7 @@ func TestClarifyPromptWithProvider(t *testing.T) {
 		ClarifyProvider: prov,
 	})
 
-	results, err := c.ClarifyPrompt(context.Background(), "my original prompt")
+	results, _, err := c.ClarifyPrompt(context.Background(), "my original prompt")
 	if err != nil {
 		t.Fatalf("ClarifyPrompt() error: %v", err)
 	}
@@ -891,7 +891,7 @@ func TestClarifyPromptPassthroughWhenNoProvider(t *testing.T) {
 		Executor: exec,
 	})
 
-	results, err := c.ClarifyPrompt(context.Background(), "some prompt")
+	results, _, err := c.ClarifyPrompt(context.Background(), "some prompt")
 	if err != nil {
 		t.Fatalf("ClarifyPrompt() error: %v", err)
 	}
@@ -917,7 +917,7 @@ func TestClarifyPromptContextWithProvider(t *testing.T) {
 		ClarifyProvider: prov,
 	})
 
-	results, err := c.ClarifyPromptContext(context.Background(), "fix the bug")
+	results, _, err := c.ClarifyPromptContext(context.Background(), "fix the bug")
 	if err != nil {
 		t.Fatalf("ClarifyPromptContext() error: %v", err)
 	}
@@ -937,7 +937,7 @@ func TestClarifyPromptContextPassthroughWhenNoProvider(t *testing.T) {
 		Executor: exec,
 	})
 
-	results, err := c.ClarifyPromptContext(context.Background(), "some prompt")
+	results, _, err := c.ClarifyPromptContext(context.Background(), "some prompt")
 	if err != nil {
 		t.Fatalf("ClarifyPromptContext() error: %v", err)
 	}
@@ -951,7 +951,7 @@ func TestClarifyPromptContextPassthroughWhenNoProvider(t *testing.T) {
 
 func TestClarifyPromptContextEmptyInput(t *testing.T) {
 	c := New(Options{})
-	_, err := c.ClarifyPromptContext(context.Background(), "")
+	_, _, err := c.ClarifyPromptContext(context.Background(), "")
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
@@ -959,7 +959,7 @@ func TestClarifyPromptContextEmptyInput(t *testing.T) {
 
 func TestClarifyPromptEmptyInput(t *testing.T) {
 	c := New(Options{})
-	_, err := c.ClarifyPrompt(context.Background(), "")
+	_, _, err := c.ClarifyPrompt(context.Background(), "")
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}

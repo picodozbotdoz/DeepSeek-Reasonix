@@ -343,6 +343,7 @@ type gitStatusMsg struct{ status gitStatus }
 // clarifyResultMsg carries the result of an async prompt refinement call.
 type clarifyResultMsg struct {
 	versions []string
+	usage    *provider.Usage
 	err      error
 }
 
@@ -355,11 +356,14 @@ type clarifyOption struct {
 
 // clarifyPicker is the modal overlay for choosing a refined prompt.
 type clarifyPicker struct {
-	options []clarifyOption
-	sel     int
-	loading bool
-	err     string
-	pending string // the original text being refined
+	options  []clarifyOption
+	sel      int
+	loading  bool
+	err      string
+	pending  string  // the original text being refined
+	expanded bool    // Ctrl+V toggles expanded view of the selected option
+	mode     string  // "Fresh" or "Contextual" — shown in the title
+	usage    *provider.Usage // token consumption from the refinement call
 }
 
 // runStatusline runs the user's custom status-line command off the event loop,
@@ -1103,7 +1107,7 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, m.startClarify(text, "")
-		case "ctrl+shift+k", "meta+k":
+		case "alt+k", "meta+k":
 			if m.state == tuiRunning {
 				return m, nil
 			}
@@ -1320,6 +1324,8 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			break
 		}
 		// The first element is always the original; remaining are refinements.
+		// Clear the pre-populated original to avoid duplicates.
+		m.clarifyPicker.options = m.clarifyPicker.options[:0]
 		for i, v := range msg.versions {
 			label := i18n.M.ClarifyOriginalLabel
 			if i > 0 {
@@ -1330,6 +1336,7 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			})
 		}
 		m.clarifyPicker.sel = 0
+		m.clarifyPicker.usage = msg.usage
 
 	case compactDoneMsg:
 		if msg.err != nil {
@@ -1551,6 +1558,7 @@ func (m chatTUI) bottomRows() int {
 		m.renderApprovalBanner(),
 		m.renderChooser(),
 		m.renderRewind(),
+		m.renderClarifyPicker(),
 		m.renderMCPImport(),
 		m.renderResumePicker(),
 		m.renderCompletion(),
@@ -3274,7 +3282,7 @@ func (m *chatTUI) startTurn(sent, displayed, restore string) tea.Cmd {
 	return m.startTurnWithRaw(sent, displayed, restore, sent)
 }
 
-// startClarify kicks off an async prompt refinement and shows a loading overlay.
+// startClarify kicks off an async prompt refinement (Fresh mode) and shows a loading overlay.
 func (m *chatTUI) startClarify(text, hint string) tea.Cmd {
 	m.clarifyPicker = &clarifyPicker{
 		options: []clarifyOption{
@@ -3283,14 +3291,15 @@ func (m *chatTUI) startClarify(text, hint string) tea.Cmd {
 		sel:     0,
 		loading: true,
 		pending: text,
+		mode:    "Fresh",
 	}
 	// Run the refinement in a goroutine, send result as tea.Msg
 	return func() tea.Msg {
-		versions, err := m.ctrl.ClarifyPrompt(context.Background(), text)
+		versions, usage, err := m.ctrl.ClarifyPrompt(context.Background(), text)
 		if err != nil {
 			return clarifyResultMsg{err: err}
 		}
-		return clarifyResultMsg{versions: versions}
+		return clarifyResultMsg{versions: versions, usage: usage}
 	}
 }
 
@@ -3303,13 +3312,14 @@ func (m *chatTUI) startClarifyContext(text string) tea.Cmd {
 		sel:     0,
 		loading: true,
 		pending: text,
+		mode:    "Contextual",
 	}
 	return func() tea.Msg {
-		versions, err := m.ctrl.ClarifyPromptContext(context.Background(), text)
+		versions, usage, err := m.ctrl.ClarifyPromptContext(context.Background(), text)
 		if err != nil {
 			return clarifyResultMsg{err: err}
 		}
-		return clarifyResultMsg{versions: versions}
+		return clarifyResultMsg{versions: versions, usage: usage}
 	}
 }
 
@@ -3326,13 +3336,22 @@ func (m chatTUI) handleClarifyKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, finalize(m, nil)
 	}
+
 	switch msg.String() {
 	case "up", "shift+tab":
-		if m.clarifyPicker.sel > 0 {
+		if !m.clarifyPicker.expanded && m.clarifyPicker.sel > 0 {
 			m.clarifyPicker.sel--
 		}
 	case "down", "tab":
-		if m.clarifyPicker.sel < len(m.clarifyPicker.options)-1 {
+		if !m.clarifyPicker.expanded && m.clarifyPicker.sel < len(m.clarifyPicker.options)-1 {
+			m.clarifyPicker.sel++
+		}
+	case "left":
+		if m.clarifyPicker.expanded && m.clarifyPicker.sel > 0 {
+			m.clarifyPicker.sel--
+		}
+	case "right":
+		if m.clarifyPicker.expanded && m.clarifyPicker.sel < len(m.clarifyPicker.options)-1 {
 			m.clarifyPicker.sel++
 		}
 	case "enter":
@@ -3343,11 +3362,17 @@ func (m chatTUI) handleClarifyKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.notice(i18n.M.ClarifySelected)
 		return m, finalize(m, nil)
 	case "esc":
-		orig := m.clarifyPicker.pending
-		m.clarifyPicker = nil
-		m.input.SetValue(orig)
-		m.growInputToFit()
-		m.notice(i18n.M.ClarifyCancelled)
+		if m.clarifyPicker.expanded {
+			m.clarifyPicker.expanded = false
+		} else {
+			orig := m.clarifyPicker.pending
+			m.clarifyPicker = nil
+			m.input.SetValue(orig)
+			m.growInputToFit()
+			m.notice(i18n.M.ClarifyCancelled)
+		}
+	case "ctrl+v":
+		m.clarifyPicker.expanded = !m.clarifyPicker.expanded
 	}
 	return m, finalize(m, nil)
 }
@@ -3361,24 +3386,157 @@ func (m chatTUI) renderClarifyPicker() string {
 	w := max(m.width, 10)
 	var b strings.Builder
 
+	title := i18n.M.ClarifyTitle
+	if p.mode != "" {
+		title += " — " + p.mode
+	}
+	if p.usage != nil && p.usage.TotalTokens > 0 {
+		title += fmt.Sprintf("  (↑%d ↓%d = %d)", p.usage.PromptTokens, p.usage.CompletionTokens, p.usage.TotalTokens)
+	}
+
 	if p.loading {
-		b.WriteString(accent(i18n.M.ClarifyTitle) + "\n")
+		b.WriteString(accent(title) + "\n")
 		b.WriteString(dim(i18n.M.ClarifyWorking))
 		return choicePanelStyle.Width(w).Render(b.String())
 	}
 
-	b.WriteString(accent(i18n.M.ClarifyTitle) + "\n")
-	b.WriteString(dim(i18n.M.ClarifyHint) + "\n")
-	for i, opt := range p.options {
-		// Show the label and a one-line preview of the text
-		preview := opt.text
-		if len([]rune(preview)) > w-6 {
-			preview = string([]rune(preview)[:w-9]) + "..."
+	// Expanded tab view: one option at a time with full text.
+	if p.expanded {
+		innerW := w - 2
+		if innerW < 20 {
+			innerW = 20
 		}
-		b.WriteString(rowLine(i == p.sel, i+1, "", opt.label+": "+preview, false) + "\n")
+		connWidth := len([]rune(connector)) // 5
+		textW := innerW - connWidth
+		if textW < 20 {
+			textW = 20
+		}
+		b.WriteString(accent(title) + "\n")
+		b.WriteString(dim(clarifyTabStrip(p.options, p.sel)) + "\n")
+
+		opt := p.options[p.sel]
+		text := cleanText(opt.text)
+		wrapped := ansi.Wrap(text, textW, "")
+		textLines := strings.Split(strings.TrimRight(wrapped, "\n"), "\n")
+		for _, ln := range textLines {
+			b.WriteString(connector + dim(ln) + "\n")
+		}
+
+		b.WriteString(dim("←/→ switch · Enter select · Ctrl+V list · Esc back"))
+		return choicePanelStyle.Width(w).Render(b.String())
+	}
+
+	// Compact list view: show all options with wrapped previews.
+	innerW := w - 2
+	if innerW < 20 {
+		innerW = 20
+	}
+	connWidth := len([]rune(connector)) // 5
+	textW := innerW - connWidth
+	if textW < 20 {
+		textW = 20
+	}
+
+	const maxPickerLines = 14
+	optionMaxLines := 4 // wrapped lines per option in compact view
+
+	var pickerLines []string
+	totalLines := 0
+	addLine := func(l string) bool {
+		if totalLines >= maxPickerLines {
+			return false
+		}
+		pickerLines = append(pickerLines, l)
+		totalLines++
+		return true
+	}
+
+	for i, opt := range p.options {
+		if totalLines >= maxPickerLines {
+			break
+		}
+
+		// Label line: Original always dimmed; refinements get bold accent
+		// when selected, dimmed otherwise.
+		isOriginal := i == 0
+		var labelLine string
+		if i == p.sel {
+			if isOriginal {
+				labelLine = dim("❯ ") + dim(bold(opt.label))
+			} else {
+				labelLine = accent("❯ ") + bold(opt.label)
+			}
+		} else {
+			labelLine = "  " + dim(opt.label)
+		}
+		if !addLine(labelLine) {
+			break
+		}
+
+		// Wrap the full text to inner width.
+		wrapped := ansi.Wrap(cleanText(opt.text), textW, "")
+		textLines := strings.Split(strings.TrimRight(wrapped, "\n"), "\n")
+
+		maxShown := optionMaxLines
+		remaining := maxPickerLines - totalLines
+		showLines := textLines
+		if len(showLines) > maxShown {
+			showLines = showLines[:maxShown]
+		}
+		if len(showLines) > remaining {
+			showLines = showLines[:remaining]
+		}
+
+		for _, ln := range showLines {
+			if !addLine(connector + dim(ln)) {
+				break
+			}
+		}
+
+		// "N more lines" hint when truncated.
+		if len(textLines) > len(showLines) {
+			more := len(textLines) - len(showLines)
+			addLine(connector + dim(fmt.Sprintf("… %d more line(s)", more)))
+		}
+	}
+
+	b.WriteString(accent(title) + "\n")
+	b.WriteString(dim(i18n.M.ClarifyHint) + "\n")
+	for _, ln := range pickerLines {
+		b.WriteString(ln + "\n")
 	}
 	b.WriteString(dim(i18n.M.ClarifyHint))
 	return choicePanelStyle.Width(w).Render(b.String())
+}
+
+// clarifyTabStrip renders a compact tab bar for the expanded option viewer.
+// The current tab gets a "●" marker and accent styling; others are dimmed.
+// Navigation arrows are shown at both ends.
+func clarifyTabStrip(options []clarifyOption, sel int) string {
+	var parts []string
+	parts = append(parts, "◀  ")
+	for i, opt := range options {
+		if i > 0 {
+			parts = append(parts, dim(" │ "))
+		}
+		if i == sel {
+			parts = append(parts, accent("● ")+opt.label)
+		} else {
+			parts = append(parts, dim(opt.label))
+		}
+	}
+	parts = append(parts, dim("  ▶"))
+	return strings.Join(parts, "")
+}
+
+// cleanText normalizes line endings in text from LLM responses:
+//   \r\n → \n  (Windows-style)
+//   \r   → \n  (old Mac-style)
+// This prevents stray carriage returns from breaking the display.
+func cleanText(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	return s
 }
 
 // startTurnWithRaw is startTurn plus an explicit `raw` (the un-resolved user

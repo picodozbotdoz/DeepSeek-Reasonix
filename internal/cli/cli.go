@@ -319,9 +319,9 @@ func runAgent(args []string) int {
 		var refined []string
 		var err error
 		if *clarifyContext {
-			refined, err = ctrl.ClarifyPromptContext(ctx, prompt)
+			refined, _, err = ctrl.ClarifyPromptContext(ctx, prompt)
 		} else {
-			refined, err = ctrl.ClarifyPrompt(ctx, prompt)
+			refined, _, err = ctrl.ClarifyPrompt(ctx, prompt)
 		}
 		if err != nil {
 			fmt.Fprintf(os.Stderr, i18n.M.ClarifyRunFailedFmt+"\n", err)

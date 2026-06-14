@@ -2666,12 +2666,12 @@ func (c *Controller) ForgetMemory(name string) error {
 // ClarifyPrompt refines the user's input text via a fresh, prefix-stable LLM
 // call (mode 2). Uses ClarifyConfig.Fresh settings for system prompt,
 // instruction, history depth, and tool names.
-func (c *Controller) ClarifyPrompt(ctx context.Context, input string) ([]string, error) {
+func (c *Controller) ClarifyPrompt(ctx context.Context, input string) ([]string, *provider.Usage, error) {
 	if strings.TrimSpace(input) == "" {
-		return nil, fmt.Errorf("nothing to clarify")
+		return nil, nil, fmt.Errorf("nothing to clarify")
 	}
 	if c.clarifyProv == nil {
-		return []string{input}, nil
+		return []string{input}, nil, nil
 	}
 
 	sysPrompt := c.clarifyCfg.Fresh.SystemPrompt
@@ -2692,12 +2692,12 @@ func (c *Controller) ClarifyPrompt(ctx context.Context, input string) ([]string,
 
 // ClarifyPromptContext refines the user's input text by sending full session
 // context (mode 1). Uses ClarifyConfig.Context settings.
-func (c *Controller) ClarifyPromptContext(ctx context.Context, input string) ([]string, error) {
+func (c *Controller) ClarifyPromptContext(ctx context.Context, input string) ([]string, *provider.Usage, error) {
 	if strings.TrimSpace(input) == "" {
-		return nil, fmt.Errorf("nothing to clarify")
+		return nil, nil, fmt.Errorf("nothing to clarify")
 	}
 	if c.clarifyProv == nil {
-		return []string{input}, nil
+		return []string{input}, nil, nil
 	}
 
 	sysPrompt := c.clarifyCfg.Context.SystemPrompt
