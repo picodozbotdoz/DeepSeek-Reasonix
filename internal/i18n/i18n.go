@@ -416,6 +416,8 @@ type Messages struct {
 	ClarifyUsage          string // /clarify usage syntax
 	ClarifyWorking        string // "refining prompt…"
 	ClarifySelected       string // "refined prompt selected — press Enter to submit"
+	ClarifyRunRefinedFmt  string // "◇ prompt refined\n  before: %s\n  after:  %s"
+	ClarifyRunFailedFmt   string // "clarify: %s (using original prompt)"
 }
 
 // ProviderStatusMessage returns an actionable explanation for a known provider

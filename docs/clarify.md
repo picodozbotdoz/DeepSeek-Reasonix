@@ -143,6 +143,39 @@ session provider is used instead.
 clarify_model = "deepseek/deepseek-chat"
 ```
 
+## Non-Interactive Mode (`reasonix run --clarify`)
+
+In non-interactive mode (`reasonix run`), add the `--clarify` (or `-C`) flag to
+refine the prompt before submitting it:
+
+```bash
+reasonix run --clarify "Write a function to parse CSV files"
+```
+
+Or with stdin:
+
+```bash
+echo "Write a function to parse CSV files" | reasonix run --clarify
+```
+
+The refinement runs automatically:
+1. The prompt is sent to the model with `Tools: nil` — same as the interactive flow
+2. The **first refined version** (not the original) is selected automatically
+3. The before/after diff is printed to stderr
+4. If refinement fails (network error, timeout), a warning is printed and the
+   original prompt is used
+
+Example output:
+
+```
+◇ prompt refined
+  before: Write a function to parse CSV files
+  after:  Create a CSV parser in internal/parse/csv.go that handles headers, quoted fields, and returns typed rows with error reporting
+```
+
+The `--clarify` flag works with `--model`, `--max-steps`, `--continue`, and
+other `reasonix run` options.
+
 ## Related
 
 - [Design document](design-clarify-phase0.md) — detailed implementation design

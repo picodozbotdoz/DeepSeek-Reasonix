@@ -2661,23 +2661,16 @@ func (c *Controller) ForgetMemory(name string) error {
 
 // ClarifyPrompt refines the user's input text via a lightweight LLM call,
 // returning the original as the first option plus 2–3 refined versions.
-// The refinement uses the optional ClarifyProvider, the executor's provider,
-// or returns a passthrough [input] when neither is available.
+// Boot always wires a ClarifyProvider, so the provider should never be nil
+// in practice. The passthrough fallback is a defensive last resort.
 func (c *Controller) ClarifyPrompt(ctx context.Context, input string) ([]string, error) {
 	if strings.TrimSpace(input) == "" {
 		return nil, fmt.Errorf("nothing to clarify")
 	}
-	prov := c.clarifyProv
-	if prov == nil && c.executor != nil {
-		// We don't expose the executor's provider directly, so we fall
-		// through to the passthrough if no dedicated clarifyProv was set.
-		// The caller (boot) should always wire a provider if possible.
+	if c.clarifyProv == nil {
 		return []string{input}, nil
 	}
-	if prov == nil {
-		return []string{input}, nil
-	}
-	return clarify.Refine(ctx, prov, input, "")
+	return clarify.Refine(ctx, c.clarifyProv, input, "")
 }
 
 // QueueMemory implements memory.Queue: when the model runs the remember/forget

@@ -3,6 +3,7 @@ package clarify
 import (
 	"context"
 	"testing"
+	"time"
 
 	"reasonix/internal/provider"
 )
@@ -145,6 +146,18 @@ func TestRefine(t *testing.T) {
 		_, err := Refine(context.Background(), prov, "some text", "")
 		if err == nil {
 			t.Fatal("expected error from provider")
+		}
+	})
+
+	t.Run("timeout via context", func(t *testing.T) {
+		// A provider that never sends should time out via ctx.Done().
+		ch := make(chan provider.Chunk) // unbuffered, never closed — blocks forever
+		prov := &streamProvider{ch: ch}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+		defer cancel()
+		_, err := Refine(ctx, prov, "some text", "")
+		if err == nil {
+			t.Fatal("expected timeout error")
 		}
 	})
 

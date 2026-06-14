@@ -62,15 +62,24 @@ func Refine(ctx context.Context, prov provider.Provider, input, focusHint string
 	}
 
 	var sb strings.Builder
-	for chunk := range ch {
-		switch chunk.Type {
-		case provider.ChunkText:
-			sb.WriteString(chunk.Text)
-		case provider.ChunkError:
-			return nil, fmt.Errorf("clarify: %w", chunk.Err)
-		case provider.ChunkToolCallStart, provider.ChunkToolCall:
-			// Ignore any tool-related chunks — the model should not be
-			// producing them since we passed Tools: nil, but handle gracefully.
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("clarify: %w", ctx.Err())
+		case chunk, ok := <-ch:
+			if !ok {
+				break loop
+			}
+			switch chunk.Type {
+			case provider.ChunkText:
+				sb.WriteString(chunk.Text)
+			case provider.ChunkError:
+				return nil, fmt.Errorf("clarify: %w", chunk.Err)
+			case provider.ChunkToolCallStart, provider.ChunkToolCall:
+				// Ignore any tool-related chunks — the model should not be
+				// producing them since we passed Tools: nil, but handle gracefully.
+			}
 		}
 	}
 

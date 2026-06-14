@@ -896,7 +896,8 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	}
 
 	// Resolve the optional clarify provider for prompt refinement.
-	var clarifyProv provider.Provider
+	// Defaults to the executor's provider when clarify_model is unset.
+	clarifyProv := execProv
 	if cm := cfg.ClarifyModel(); cm != "" {
 		ce, ok := cfg.ResolveModel(cm)
 		if !ok {

@@ -401,4 +401,6 @@ Configuration:
 	ClarifyUsage:         "usage: /clarify <text to refine>  or  type a prompt and press Ctrl+K",
 	ClarifyWorking:       "refining prompt…",
 	ClarifySelected:      "refined prompt selected — press Enter to submit",
+	ClarifyRunRefinedFmt: "◇ prompt refined\n  before: %s\n  after:  %s",
+	ClarifyRunFailedFmt:  "clarify: %s (using original prompt)",
 }

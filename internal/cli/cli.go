@@ -236,6 +236,8 @@ func runAgent(args []string) int {
 	cont := fs.Bool("continue", false, "resume the most recent saved session")
 	fs.BoolVar(cont, "c", false, "shorthand for --continue")
 	resume := fs.String("resume", "", "resume a specific session file (non-interactive; takes precedence over --continue)")
+	clarify := fs.Bool("clarify", false, "refine the prompt with AI before running")
+	fs.BoolVar(clarify, "C", false, "shorthand for --clarify")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -310,6 +312,18 @@ func runAgent(args []string) int {
 	}
 	if ctrl.SessionPath() == "" && ctrl.SessionDir() != "" {
 		ctrl.SetSessionPath(agent.NewSessionPath(ctrl.SessionDir(), ctrl.Label()))
+	}
+
+	if *clarify {
+		refined, err := ctrl.ClarifyPrompt(ctx, prompt)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, i18n.M.ClarifyRunFailedFmt+"\n", err)
+		} else if len(refined) > 1 {
+			// Pick the first refinement (index 1; index 0 is always the original).
+			fmt.Fprintf(os.Stderr, i18n.M.ClarifyRunRefinedFmt+"\n",
+				ellipsize(prompt, 48), ellipsize(refined[1], 48))
+			prompt = refined[1]
+		}
 	}
 
 	runErr := ctrl.Run(ctx, prompt)
@@ -1596,6 +1610,15 @@ func readStdin() string {
 	}
 	data, _ := io.ReadAll(os.Stdin)
 	return strings.TrimSpace(string(data))
+}
+
+// ellipsize truncates s to at most n runes, appending "..." when truncated.
+func ellipsize(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "..."
 }
 
 // welcome is the zero-arg landing screen: it reports config and key readiness,
