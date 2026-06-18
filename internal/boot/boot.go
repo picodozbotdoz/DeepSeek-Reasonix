@@ -928,6 +928,11 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		}
 	}
 
+	// Add async delegation guidance when worker plugins are configured
+	if guidance := asyncDelegationGuidance(autoStartEntries); guidance != "" {
+		sysPrompt += "\n\n" + guidance
+	}
+
 	ctrlOpts := control.Options{
 		Runner:                 runner,
 		Executor:               executor,
