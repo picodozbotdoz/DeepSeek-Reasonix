@@ -190,12 +190,14 @@ func serve(in *os.File, out *os.File, learnerDir string, monoTaskACP bool, maxId
 	}
 
 	bridge := &acpBridge{
-		learnerDir:   learnerDir,
-		pool:         pool,
-		monoTaskACP:  monoTaskACP,
-		taskTimeout:  taskTimeout,
-		descOverride: descOverride,
-		workers:      make(map[string]*asyncWorker),
+		learnerDir:        learnerDir,
+		pool:              pool,
+		monoTaskACP:       monoTaskACP,
+		taskTimeout:       taskTimeout,
+		descOverride:      descOverride,
+		workers:           make(map[string]*asyncWorker),
+		heartbeatInterval: 5 * time.Minute,
+		deadTimeout:       10 * time.Minute,
 	}
 
 	for {
@@ -250,6 +252,10 @@ type acpBridge struct {
 	workers   map[string]*asyncWorker
 	workerSeq int
 	workerMu  sync.Mutex
+
+	// Heartbeat configuration
+	heartbeatInterval time.Duration // default 5m
+	deadTimeout       time.Duration // default 10m
 }
 
 // asyncWorker tracks a background worker started via delegate_task_async.
@@ -265,6 +271,12 @@ type asyncWorker struct {
 	SessionID string
 	client    *acpClient
 	cancel    context.CancelFunc
+	mu        sync.Mutex // protects Status, Result, Error, LastHeartbeat, LastResponse, HeartbeatOK
+
+	// Heartbeat monitoring
+	LastHeartbeat time.Time
+	LastResponse  time.Time
+	HeartbeatOK   bool
 }
 
 // ─── ACP process pool ───────────────────────────────────────────────────
@@ -516,6 +528,24 @@ func (b *acpBridge) toolList() []map[string]any {
 				"title":        "Check worker status",
 			},
 		},
+		{
+			"name":        "worker_kill",
+			"description": "Kill a running background worker started with delegate_task_async. The worker's ACP session is closed and the process is terminated. Returns the worker's final status.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"worker_id": map[string]any{
+						"type":        "string",
+						"description": "The worker ID returned by delegate_task_async.",
+					},
+				},
+				"required": []string{"worker_id"},
+			},
+			"annotations": map[string]any{
+				"readOnlyHint": false,
+				"title":        "Kill background worker",
+			},
+		},
 	}
 }
 
@@ -570,6 +600,18 @@ func (b *acpBridge) callTool(params json.RawMessage) (any, *rpcError) {
 		status, err := b.workerStatus(workerID)
 		if err != nil {
 			return textResult(fmt.Sprintf("error checking worker status: %v", err), true), nil
+		}
+		return textResult(status, false), nil
+
+	case "worker_kill":
+		workerID, _ := p.Arguments["worker_id"].(string)
+		if workerID == "" {
+			return textResult("argument 'worker_id' is required", true), nil
+		}
+
+		status, err := b.workerKill(workerID)
+		if err != nil {
+			return textResult(fmt.Sprintf("error killing worker: %v", err), true), nil
 		}
 		return textResult(status, false), nil
 
@@ -1100,17 +1142,23 @@ func (b *acpBridge) delegateTaskAsync(task, cwd string) (string, error) {
 	workerID := fmt.Sprintf("worker-%d", b.workerSeq)
 	ctx, cancel := context.WithCancel(context.Background())
 	worker := &asyncWorker{
-		ID:        workerID,
-		Task:      task,
-		Cwd:       cwd,
-		Status:    "running",
-		StartedAt: time.Now(),
-		SessionID: sessionID,
-		client:    client,
-		cancel:    cancel,
+		ID:            workerID,
+		Task:          task,
+		Cwd:           cwd,
+		Status:        "running",
+		StartedAt:     time.Now(),
+		LastHeartbeat: time.Now(),
+		LastResponse:  time.Now(),
+		HeartbeatOK:   true,
+		SessionID:     sessionID,
+		client:        client,
+		cancel:        cancel,
 	}
 	b.workers[workerID] = worker
 	b.workerMu.Unlock()
+
+	// Start heartbeat monitor
+	go b.heartbeatMonitor(ctx, worker)
 
 	// Start the worker in a goroutine
 	go b.runAsyncWorker(ctx, worker, transcriptPath)
@@ -1150,9 +1198,11 @@ func (b *acpBridge) runAsyncWorker(ctx context.Context, w *asyncWorker, transcri
 			w.client.acpCall("session/close", map[string]any{"sessionId": w.SessionID})
 			b.pool.discard(w.client)
 
+			w.mu.Lock()
 			w.Status = "failed"
 			w.Error = res.err.Error()
 			w.DoneAt = time.Now()
+			w.mu.Unlock()
 			log.Printf("async worker %s failed: %v", w.ID, res.err)
 			return
 		}
@@ -1179,9 +1229,11 @@ func (b *acpBridge) runAsyncWorker(ctx context.Context, w *asyncWorker, transcri
 
 		// Format and store result
 		output := formatResult(res.notifs)
+		w.mu.Lock()
 		w.Result = output
 		w.Status = "done"
 		w.DoneAt = time.Now()
+		w.mu.Unlock()
 
 		b.pool.put(w.client)
 		log.Printf("async worker %s done: reason=%s, output=%d chars", w.ID, promptResult.StopReason, len(output))
@@ -1191,9 +1243,11 @@ func (b *acpBridge) runAsyncWorker(ctx context.Context, w *asyncWorker, transcri
 		w.client.acpCall("session/close", map[string]any{"sessionId": w.SessionID})
 		b.pool.discard(w.client)
 
+		w.mu.Lock()
 		w.Status = "killed"
 		w.Error = "cancelled"
 		w.DoneAt = time.Now()
+		w.mu.Unlock()
 		log.Printf("async worker %s killed", w.ID)
 	}
 }
@@ -1208,6 +1262,9 @@ func (b *acpBridge) workerStatus(workerID string) (string, error) {
 		return "", fmt.Errorf("worker %q not found", workerID)
 	}
 
+	worker.mu.Lock()
+	defer worker.mu.Unlock()
+
 	var status strings.Builder
 	fmt.Fprintf(&status, "[%s] %s", worker.ID, worker.Status)
 	fmt.Fprintf(&status, "\nTask: %s", truncateString(worker.Task, 100))
@@ -1217,6 +1274,9 @@ func (b *acpBridge) workerStatus(workerID string) (string, error) {
 	if worker.Status == "running" {
 		elapsed := time.Since(worker.StartedAt)
 		fmt.Fprintf(&status, "\nElapsed: %s", elapsed.Round(time.Second))
+		fmt.Fprintf(&status, "\nHeartbeat: %s (last response: %s ago)",
+			heartbeatStatus(worker.HeartbeatOK),
+			time.Since(worker.LastResponse).Round(time.Second))
 	} else {
 		fmt.Fprintf(&status, "\nDuration: %s", worker.DoneAt.Sub(worker.StartedAt).Round(time.Second))
 	}
@@ -1228,6 +1288,106 @@ func (b *acpBridge) workerStatus(workerID string) (string, error) {
 	}
 
 	return status.String(), nil
+}
+
+// heartbeatStatus returns a human-readable heartbeat status.
+func heartbeatStatus(ok bool) string {
+	if ok {
+		return "OK"
+	}
+	return "FAILED"
+}
+
+// workerKill kills a running async worker.
+func (b *acpBridge) workerKill(workerID string) (string, error) {
+	b.workerMu.Lock()
+	worker, ok := b.workers[workerID]
+	b.workerMu.Unlock()
+
+	if !ok {
+		return "", fmt.Errorf("worker %q not found", workerID)
+	}
+
+	worker.mu.Lock()
+	status := worker.Status
+	worker.mu.Unlock()
+
+	if status != "running" {
+		return fmt.Sprintf("[%s] already %s", worker.ID, status), nil
+	}
+
+	// Cancel the worker context
+	worker.cancel()
+
+	// Wait briefly for cleanup
+	time.Sleep(100 * time.Millisecond)
+
+	b.workerMu.Lock()
+	worker, ok = b.workers[workerID]
+	b.workerMu.Unlock()
+
+	if ok {
+		worker.mu.Lock()
+		finalStatus := worker.Status
+		worker.mu.Unlock()
+		return fmt.Sprintf("[%s] killed (was %s)", worker.ID, finalStatus), nil
+	}
+
+	return fmt.Sprintf("[%s] kill signal sent", workerID), nil
+}
+
+// heartbeatMonitor periodically checks if a worker is alive and kills it if dead.
+func (b *acpBridge) heartbeatMonitor(ctx context.Context, w *asyncWorker) {
+	ticker := time.NewTicker(b.heartbeatInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Check if worker is still running
+			w.mu.Lock()
+			status := w.Status
+			lastResponse := w.LastResponse
+			w.mu.Unlock()
+
+			if status != "running" {
+				return // worker finished
+			}
+
+			// Check for dead worker (no response in deadTimeout)
+			if time.Since(lastResponse) > b.deadTimeout {
+				log.Printf("heartbeat: worker %s dead (no response in %s), killing", w.ID, b.deadTimeout)
+				w.cancel()
+				return
+			}
+
+			// Send heartbeat ping
+			go b.sendHeartbeat(w)
+		}
+	}
+}
+
+// sendHeartbeat pings a worker to check if it's alive.
+func (b *acpBridge) sendHeartbeat(w *asyncWorker) {
+	// Send an empty prompt as heartbeat
+	_, _, err := w.client.acpCall("session/prompt", map[string]any{
+		"sessionId": w.SessionID,
+		"prompt":    []map[string]any{{"type": "text", "text": "__heartbeat__"}},
+	})
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if err != nil {
+		w.HeartbeatOK = false
+		log.Printf("heartbeat: worker %s failed: %v", w.ID, err)
+	} else {
+		w.LastHeartbeat = time.Now()
+		w.LastResponse = time.Now()
+		w.HeartbeatOK = true
+	}
 }
 
 // truncateString truncates a string to maxLen, adding "..." if truncated.
