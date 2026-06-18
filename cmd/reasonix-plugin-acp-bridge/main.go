@@ -546,6 +546,18 @@ func (b *acpBridge) toolList() []map[string]any {
 				"title":        "Kill background worker",
 			},
 		},
+		{
+			"name":        "worker_list",
+			"description": "List all background workers started with delegate_task_async. Shows status, elapsed time, and task summary for each worker.",
+			"inputSchema": map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
+			},
+			"annotations": map[string]any{
+				"readOnlyHint": true,
+				"title":        "List background workers",
+			},
+		},
 	}
 }
 
@@ -614,6 +626,13 @@ func (b *acpBridge) callTool(params json.RawMessage) (any, *rpcError) {
 			return textResult(fmt.Sprintf("error killing worker: %v", err), true), nil
 		}
 		return textResult(status, false), nil
+
+	case "worker_list":
+		list, err := b.workerList()
+		if err != nil {
+			return textResult(fmt.Sprintf("error listing workers: %v", err), true), nil
+		}
+		return textResult(list, false), nil
 
 	default:
 		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown tool: " + p.Name}
@@ -1334,6 +1353,49 @@ func (b *acpBridge) workerKill(workerID string) (string, error) {
 	}
 
 	return fmt.Sprintf("[%s] kill signal sent", workerID), nil
+}
+
+// workerList returns a summary of all workers.
+func (b *acpBridge) workerList() (string, error) {
+	b.workerMu.Lock()
+	workers := make([]*asyncWorker, 0, len(b.workers))
+	for _, w := range b.workers {
+		workers = append(workers, w)
+	}
+	b.workerMu.Unlock()
+
+	if len(workers) == 0 {
+		return "No background workers.", nil
+	}
+
+	var list strings.Builder
+	fmt.Fprintf(&list, "Background workers (%d):\n", len(workers))
+
+	for _, w := range workers {
+		w.mu.Lock()
+		status := w.Status
+		task := truncateString(w.Task, 50)
+		started := w.StartedAt
+		done := w.DoneAt
+		heartbeat := w.HeartbeatOK
+		lastResponse := w.LastResponse
+		w.mu.Unlock()
+
+		fmt.Fprintf(&list, "\n[%s] %s", w.ID, status)
+		fmt.Fprintf(&list, "\n  Task: %s", task)
+
+		if status == "running" {
+			elapsed := time.Since(started)
+			fmt.Fprintf(&list, "\n  Elapsed: %s", elapsed.Round(time.Second))
+			fmt.Fprintf(&list, "\n  Heartbeat: %s (last: %s ago)",
+				heartbeatStatus(heartbeat),
+				time.Since(lastResponse).Round(time.Second))
+		} else {
+			fmt.Fprintf(&list, "\n  Duration: %s", done.Sub(started).Round(time.Second))
+		}
+	}
+
+	return list.String(), nil
 }
 
 // heartbeatMonitor periodically checks if a worker is alive and kills it if dead.
