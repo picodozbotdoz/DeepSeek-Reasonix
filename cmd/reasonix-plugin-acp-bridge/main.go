@@ -1461,12 +1461,11 @@ func (b *acpBridge) heartbeatMonitor(ctx context.Context, w *asyncWorker) {
 }
 
 // sendHeartbeat pings a worker to check if it's alive.
+// Uses session/list instead of session/prompt to avoid interfering with the worker's task.
 func (b *acpBridge) sendHeartbeat(w *asyncWorker) {
-	// Send an empty prompt as heartbeat
-	_, _, err := w.client.acpCall("session/prompt", map[string]any{
-		"sessionId": w.SessionID,
-		"prompt":    []map[string]any{{"type": "text", "text": "__heartbeat__"}},
-	})
+	// Use session/list as a lightweight liveness check
+	// This doesn't send a prompt to the worker, so it won't interfere with its task
+	_, _, err := w.client.acpCall("session/list", map[string]any{})
 
 	w.mu.Lock()
 	defer w.mu.Unlock()
