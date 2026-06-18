@@ -181,6 +181,9 @@ Create `<learnerDir>/worker.toml` to customize behavior:
 description = "Code implementation worker"
 heartbeat_interval = "2m"
 dead_timeout = "5m"
+auto_restart = true
+max_restarts = 3
+restart_backoff = "30s"
 ```
 
 | Field | Default | Description |
@@ -188,6 +191,9 @@ dead_timeout = "5m"
 | `description` | (none) | Custom tool description for this worker |
 | `heartbeat_interval` | `5m` | How often to ping running workers |
 | `dead_timeout` | `10m` | Kill worker if no response in this time |
+| `auto_restart` | `false` | Automatically restart dead workers |
+| `max_restarts` | `3` | Maximum restart attempts |
+| `restart_backoff` | `30s` | Base backoff between restarts (exponential) |
 
 Set `heartbeat_interval = "0"` to disable heartbeat monitoring.
 

@@ -193,6 +193,9 @@ func serve(in *os.File, out *os.File, learnerDir string, monoTaskACP bool, maxId
 	cfg := loadWorkerConfig(learnerDir)
 	heartbeatInterval := 5 * time.Minute
 	deadTimeout := 10 * time.Minute
+	autoRestart := false
+	maxRestarts := 3
+	restartBackoff := 30 * time.Second
 
 	if cfg.HeartbeatInterval != "" {
 		if d, err := time.ParseDuration(cfg.HeartbeatInterval); err == nil {
@@ -203,6 +206,17 @@ func serve(in *os.File, out *os.File, learnerDir string, monoTaskACP bool, maxId
 		if d, err := time.ParseDuration(cfg.DeadTimeout); err == nil {
 			deadTimeout = d
 		}
+	}
+	if cfg.RestartBackoff != "" {
+		if d, err := time.ParseDuration(cfg.RestartBackoff); err == nil {
+			restartBackoff = d
+		}
+	}
+	if cfg.MaxRestarts > 0 {
+		maxRestarts = cfg.MaxRestarts
+	}
+	if cfg.AutoRestart {
+		autoRestart = true
 	}
 
 	// If descOverride not set via CLI, use config value
@@ -219,6 +233,9 @@ func serve(in *os.File, out *os.File, learnerDir string, monoTaskACP bool, maxId
 		workers:           make(map[string]*asyncWorker),
 		heartbeatInterval: heartbeatInterval,
 		deadTimeout:       deadTimeout,
+		autoRestart:       autoRestart,
+		maxRestarts:       maxRestarts,
+		restartBackoff:    restartBackoff,
 	}
 
 	for {
@@ -252,6 +269,16 @@ type workerConfig struct {
 	// DeadTimeout is how long to wait for a response before killing a worker
 	// (default 10m). Only effective when heartbeat monitoring is enabled.
 	DeadTimeout string `toml:"dead_timeout"`
+
+	// AutoRestart enables automatic restart of dead workers (default false).
+	AutoRestart bool `toml:"auto_restart"`
+
+	// MaxRestarts is the maximum number of restart attempts (default 3).
+	MaxRestarts int `toml:"max_restarts"`
+
+	// RestartBackoff is the base backoff duration between restarts (default 30s).
+	// Actual backoff is base * 2^attempt (exponential).
+	RestartBackoff string `toml:"restart_backoff"`
 }
 
 // loadWorkerConfig reads worker.toml from dir. A missing or empty file returns
@@ -285,6 +312,11 @@ type acpBridge struct {
 	// Heartbeat configuration
 	heartbeatInterval time.Duration // default 5m
 	deadTimeout       time.Duration // default 10m
+
+	// Auto-restart configuration
+	autoRestart    bool          // default false
+	maxRestarts    int           // default 3
+	restartBackoff time.Duration // default 30s
 }
 
 // asyncWorker tracks a background worker started via delegate_task_async.
@@ -306,6 +338,9 @@ type asyncWorker struct {
 	LastHeartbeat time.Time
 	LastResponse  time.Time
 	HeartbeatOK   bool
+
+	// Auto-restart tracking
+	RestartCount int // number of restart attempts
 }
 
 // ─── ACP process pool ───────────────────────────────────────────────────
@@ -1329,6 +1364,10 @@ func (b *acpBridge) workerStatus(workerID string) (string, error) {
 		fmt.Fprintf(&status, "\nDuration: %s", worker.DoneAt.Sub(worker.StartedAt).Round(time.Second))
 	}
 
+	if worker.RestartCount > 0 {
+		fmt.Fprintf(&status, "\nRestarts: %d", worker.RestartCount)
+	}
+
 	if worker.Status == "done" {
 		fmt.Fprintf(&status, "\nResult:\n%s", worker.Result)
 	} else if worker.Status == "failed" {
@@ -1449,8 +1488,22 @@ func (b *acpBridge) heartbeatMonitor(ctx context.Context, w *asyncWorker) {
 
 			// Check for dead worker (no response in deadTimeout)
 			if time.Since(lastResponse) > b.deadTimeout {
-				log.Printf("heartbeat: worker %s dead (no response in %s), killing", w.ID, b.deadTimeout)
+				log.Printf("heartbeat: worker %s dead (no response in %s)", w.ID, b.deadTimeout)
+
+				// Mark as dead
+				w.mu.Lock()
+				w.Status = "failed"
+				w.Error = "heartbeat timeout"
+				w.DoneAt = time.Now()
+				w.mu.Unlock()
+
+				// Cancel the worker
 				w.cancel()
+
+				// Auto-restart if enabled and within restart limit
+				if b.autoRestart && w.RestartCount < b.maxRestarts {
+					go b.restartWorker(w)
+				}
 				return
 			}
 
@@ -1458,6 +1511,51 @@ func (b *acpBridge) heartbeatMonitor(ctx context.Context, w *asyncWorker) {
 			go b.sendHeartbeat(w)
 		}
 	}
+}
+
+// restartWorker restarts a dead worker with exponential backoff.
+func (b *acpBridge) restartWorker(w *asyncWorker) {
+	w.mu.Lock()
+	attempt := w.RestartCount + 1
+	w.RestartCount = attempt
+	task := w.Task
+	cwd := w.Cwd
+	w.mu.Unlock()
+
+	// Calculate backoff: base * 2^(attempt-1)
+	backoff := b.restartBackoff
+	for i := 1; i < attempt; i++ {
+		backoff *= 2
+	}
+	// Cap at 5 minutes
+	if backoff > 5*time.Minute {
+		backoff = 5 * time.Minute
+	}
+
+	log.Printf("restart: worker %s restarting in %s (attempt %d/%d)", w.ID, backoff, attempt, b.maxRestarts)
+
+	time.Sleep(backoff)
+
+	// Check if bridge is still alive
+	w.mu.Lock()
+	if w.Status != "failed" {
+		w.mu.Unlock()
+		return // worker was manually restarted or killed
+	}
+	w.mu.Unlock()
+
+	// Start new worker with same task
+	_, err := b.delegateTaskAsync(task, cwd)
+	if err != nil {
+		log.Printf("restart: failed to restart worker %s: %v", w.ID, err)
+		w.mu.Lock()
+		w.Status = "failed"
+		w.Error = "restart failed: " + err.Error()
+		w.mu.Unlock()
+		return
+	}
+
+	log.Printf("restart: worker %s restarted successfully (attempt %d)", w.ID, attempt)
 }
 
 // sendHeartbeat pings a worker to check if it's alive.
