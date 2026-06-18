@@ -111,6 +111,24 @@ command = "reasonix-plugin-acp-bridge"
 args = ["-learner-dir", "./workers/worker-3"]
 ```
 
+### worker.toml (Per-Worker Config)
+
+Create `<learnerDir>/worker.toml` to customize behavior:
+
+```toml
+description = "Code implementation worker"
+heartbeat_interval = "2m"
+dead_timeout = "5m"
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `description` | (none) | Custom tool description for this worker |
+| `heartbeat_interval` | `5m` | How often to ping running workers |
+| `dead_timeout` | `10m` | Kill worker if no response in this time |
+
+Set `heartbeat_interval = "0"` to disable heartbeat monitoring.
+
 ## How It Works
 
 ### Async Delegation Flow

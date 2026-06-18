@@ -189,6 +189,27 @@ func serve(in *os.File, out *os.File, learnerDir string, monoTaskACP bool, maxId
 		defer pool.drain()
 	}
 
+	// Load worker config for heartbeat/dead timeout settings
+	cfg := loadWorkerConfig(learnerDir)
+	heartbeatInterval := 5 * time.Minute
+	deadTimeout := 10 * time.Minute
+
+	if cfg.HeartbeatInterval != "" {
+		if d, err := time.ParseDuration(cfg.HeartbeatInterval); err == nil {
+			heartbeatInterval = d
+		}
+	}
+	if cfg.DeadTimeout != "" {
+		if d, err := time.ParseDuration(cfg.DeadTimeout); err == nil {
+			deadTimeout = d
+		}
+	}
+
+	// If descOverride not set via CLI, use config value
+	if descOverride == "" && cfg.Description != "" {
+		descOverride = cfg.Description
+	}
+
 	bridge := &acpBridge{
 		learnerDir:        learnerDir,
 		pool:              pool,
@@ -196,8 +217,8 @@ func serve(in *os.File, out *os.File, learnerDir string, monoTaskACP bool, maxId
 		taskTimeout:       taskTimeout,
 		descOverride:      descOverride,
 		workers:           make(map[string]*asyncWorker),
-		heartbeatInterval: 5 * time.Minute,
-		deadTimeout:       10 * time.Minute,
+		heartbeatInterval: heartbeatInterval,
+		deadTimeout:       deadTimeout,
 	}
 
 	for {
@@ -223,6 +244,14 @@ type workerConfig struct {
 	// Description overrides the generic delegate_task description. Use it to
 	// tell the manager what this worker specialises in.
 	Description string `toml:"description"`
+
+	// HeartbeatInterval is how often to ping running workers (default 5m).
+	// Set to 0 to disable heartbeat monitoring.
+	HeartbeatInterval string `toml:"heartbeat_interval"`
+
+	// DeadTimeout is how long to wait for a response before killing a worker
+	// (default 10m). Only effective when heartbeat monitoring is enabled.
+	DeadTimeout string `toml:"dead_timeout"`
 }
 
 // loadWorkerConfig reads worker.toml from dir. A missing or empty file returns
