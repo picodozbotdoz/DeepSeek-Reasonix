@@ -75,6 +75,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -188,7 +189,14 @@ func serve(in *os.File, out *os.File, learnerDir string, monoTaskACP bool, maxId
 		defer pool.drain()
 	}
 
-	bridge := &acpBridge{learnerDir: learnerDir, pool: pool, monoTaskACP: monoTaskACP, taskTimeout: taskTimeout, descOverride: descOverride}
+	bridge := &acpBridge{
+		learnerDir:   learnerDir,
+		pool:         pool,
+		monoTaskACP:  monoTaskACP,
+		taskTimeout:  taskTimeout,
+		descOverride: descOverride,
+		workers:      make(map[string]*asyncWorker),
+	}
 
 	for {
 		line, err := r.ReadBytes('\n')
@@ -237,6 +245,26 @@ type acpBridge struct {
 	monoTaskACP  bool
 	taskTimeout  time.Duration // per-delegate_task timeout (default 5m)
 	descOverride string       // from worker.toml, overrides delegate_task description
+
+	// Async worker tracking
+	workers   map[string]*asyncWorker
+	workerSeq int
+	workerMu  sync.Mutex
+}
+
+// asyncWorker tracks a background worker started via delegate_task_async.
+type asyncWorker struct {
+	ID        string
+	Task      string
+	Cwd       string
+	Status    string // "running", "done", "failed", "killed"
+	Result    string
+	Error     string
+	StartedAt time.Time
+	DoneAt    time.Time
+	SessionID string
+	client    *acpClient
+	cancel    context.CancelFunc
 }
 
 // ─── ACP process pool ───────────────────────────────────────────────────
@@ -448,6 +476,46 @@ func (b *acpBridge) toolList() []map[string]any {
 				"title":        "Delegate task to learner",
 			},
 		},
+		{
+			"name":        "delegate_task_async",
+			"description": "Start a task on the learner agent without blocking. Returns a worker_id immediately. Use worker_status to check progress and get the result when done. This allows starting multiple workers in parallel and checking them later.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"task": map[string]any{
+						"type":        "string",
+						"description": "The task description for the learner agent. Be specific and include all context the learner needs.",
+					},
+					"cwd": map[string]any{
+						"type":        "string",
+						"description": "Working directory for the learner session (absolute path). Defaults to learner dir.",
+					},
+				},
+				"required": []string{"task"},
+			},
+			"annotations": map[string]any{
+				"readOnlyHint": false,
+				"title":        "Start async task on learner",
+			},
+		},
+		{
+			"name":        "worker_status",
+			"description": "Check the status of a background worker started with delegate_task_async. Returns the worker's status (running/done/failed) and result if complete. Does not block.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"worker_id": map[string]any{
+						"type":        "string",
+						"description": "The worker ID returned by delegate_task_async.",
+					},
+				},
+				"required": []string{"worker_id"},
+			},
+			"annotations": map[string]any{
+				"readOnlyHint": true,
+				"title":        "Check worker status",
+			},
+		},
 	}
 }
 
@@ -459,24 +527,55 @@ func (b *acpBridge) callTool(params json.RawMessage) (any, *rpcError) {
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, &rpcError{Code: codeInvalidParams, Message: "invalid params: " + err.Error()}
 	}
-	if p.Name != "delegate_task" {
+
+	switch p.Name {
+	case "delegate_task":
+		task, _ := p.Arguments["task"].(string)
+		cwd, _ := p.Arguments["cwd"].(string)
+
+		if task == "" {
+			return textResult("argument 'task' is required and must be a non-empty string", true), nil
+		}
+
+		log.Printf("delegate_task called, task length=%d, cwd=%s", len(task), strOr(cwd, b.learnerDir))
+
+		result, err := b.delegateTask(task, cwd)
+		if err != nil {
+			return textResult(fmt.Sprintf("error delegating task: %v", err), true), nil
+		}
+		return textResult(result, false), nil
+
+	case "delegate_task_async":
+		task, _ := p.Arguments["task"].(string)
+		cwd, _ := p.Arguments["cwd"].(string)
+
+		if task == "" {
+			return textResult("argument 'task' is required and must be a non-empty string", true), nil
+		}
+
+		log.Printf("delegate_task_async called, task length=%d, cwd=%s", len(task), strOr(cwd, b.learnerDir))
+
+		workerID, err := b.delegateTaskAsync(task, cwd)
+		if err != nil {
+			return textResult(fmt.Sprintf("error starting async task: %v", err), true), nil
+		}
+		return textResult(fmt.Sprintf("Worker started: %s. Use worker_status(worker_id=%q) to check progress.", workerID, workerID), false), nil
+
+	case "worker_status":
+		workerID, _ := p.Arguments["worker_id"].(string)
+		if workerID == "" {
+			return textResult("argument 'worker_id' is required", true), nil
+		}
+
+		status, err := b.workerStatus(workerID)
+		if err != nil {
+			return textResult(fmt.Sprintf("error checking worker status: %v", err), true), nil
+		}
+		return textResult(status, false), nil
+
+	default:
 		return nil, &rpcError{Code: codeInvalidParams, Message: "unknown tool: " + p.Name}
 	}
-
-	task, _ := p.Arguments["task"].(string)
-	cwd, _ := p.Arguments["cwd"].(string)
-
-	if task == "" {
-		return textResult("argument 'task' is required and must be a non-empty string", true), nil
-	}
-
-	log.Printf("delegate_task called, task length=%d, cwd=%s", len(task), strOr(cwd, b.learnerDir))
-
-	result, err := b.delegateTask(task, cwd)
-	if err != nil {
-		return textResult(fmt.Sprintf("error delegating task: %v", err), true), nil
-	}
-	return textResult(result, false), nil
 }
 
 func textResult(text string, isError bool) map[string]any {
@@ -930,6 +1029,213 @@ func (b *acpBridge) delegateTask(task string, cwd string) (string, error) {
 		}
 		return "", fmt.Errorf("delegate_task timed out after %s", b.taskTimeout)
 	}
+}
+
+// ─── Async worker delegation ────────────────────────────────────────────
+
+// delegateTaskAsync starts a worker task without blocking. Returns a worker ID
+// that can be used with workerStatus() to check progress and get the result.
+func (b *acpBridge) delegateTaskAsync(task, cwd string) (string, error) {
+	if cwd == "" {
+		cwd = b.learnerDir
+	}
+
+	// Get an ACP client from the pool
+	client, err := b.pool.get()
+	if err != nil {
+		return "", err
+	}
+
+	// Initialize the ACP session
+	_, _, err = client.acpCall("initialize", map[string]any{
+		"protocolVersion": 1,
+		"clientInfo":      map[string]any{"name": "reasonix-manager-async", "version": version},
+	})
+	if err != nil {
+		b.pool.discard(client)
+		return "", fmt.Errorf("initialize: %w", err)
+	}
+
+	// Try to resume previous session, or create a new one
+	sessionID := ""
+	transcriptPath := ""
+
+	prevState, err := loadSessionState(b.learnerDir, cwd)
+	if err != nil {
+		log.Printf("warning: failed to load session state: %v", err)
+	}
+	if prevState != nil {
+		_, _, err = client.acpCall("session/load", map[string]any{
+			"sessionId": prevState.SessionID,
+			"cwd":       cwd,
+		})
+		if err != nil {
+			log.Printf("session/load failed (%v), creating new session", err)
+			prevState = nil
+		} else {
+			sessionID = prevState.SessionID
+			transcriptPath = prevState.TranscriptPath
+		}
+	}
+
+	if prevState == nil {
+		resultRaw, _, err := client.acpCall("session/new", map[string]any{"cwd": cwd})
+		if err != nil {
+			b.pool.discard(client)
+			return "", fmt.Errorf("session/new: %w", err)
+		}
+		var sessionResult struct {
+			SessionID string `json:"sessionId"`
+		}
+		if err := json.Unmarshal(resultRaw, &sessionResult); err != nil {
+			b.pool.discard(client)
+			return "", fmt.Errorf("parse session/new result: %w", err)
+		}
+		sessionID = sessionResult.SessionID
+	}
+
+	// Create async worker tracker
+	b.workerMu.Lock()
+	b.workerSeq++
+	workerID := fmt.Sprintf("worker-%d", b.workerSeq)
+	ctx, cancel := context.WithCancel(context.Background())
+	worker := &asyncWorker{
+		ID:        workerID,
+		Task:      task,
+		Cwd:       cwd,
+		Status:    "running",
+		StartedAt: time.Now(),
+		SessionID: sessionID,
+		client:    client,
+		cancel:    cancel,
+	}
+	b.workers[workerID] = worker
+	b.workerMu.Unlock()
+
+	// Start the worker in a goroutine
+	go b.runAsyncWorker(ctx, worker, transcriptPath)
+
+	log.Printf("async worker %s started: task length=%d, cwd=%s, session=%s", workerID, len(task), cwd, sessionID)
+	return workerID, nil
+}
+
+// runAsyncWorker executes the worker task in the background.
+func (b *acpBridge) runAsyncWorker(ctx context.Context, w *asyncWorker, transcriptPath string) {
+	defer func() {
+		w.cancel()
+	}()
+
+	// Send the task prompt
+	promptCh := make(chan struct {
+		raw    json.RawMessage
+		notifs []json.RawMessage
+		err    error
+	}, 1)
+
+	go func() {
+		promptRaw, notifs, perr := w.client.acpCall("session/prompt", map[string]any{
+			"sessionId": w.SessionID,
+			"prompt":    []map[string]any{{"type": "text", "text": w.Task}},
+		})
+		promptCh <- struct {
+			raw    json.RawMessage
+			notifs []json.RawMessage
+			err    error
+		}{promptRaw, notifs, perr}
+	}()
+
+	select {
+	case res := <-promptCh:
+		if res.err != nil {
+			w.client.acpCall("session/close", map[string]any{"sessionId": w.SessionID})
+			b.pool.discard(w.client)
+
+			w.Status = "failed"
+			w.Error = res.err.Error()
+			w.DoneAt = time.Now()
+			log.Printf("async worker %s failed: %v", w.ID, res.err)
+			return
+		}
+
+		var promptResult struct {
+			StopReason     string  `json:"stopReason"`
+			TranscriptPath *string `json:"transcriptPath,omitempty"`
+		}
+		json.Unmarshal(res.raw, &promptResult)
+
+		if promptResult.TranscriptPath != nil && *promptResult.TranscriptPath != "" {
+			transcriptPath = *promptResult.TranscriptPath
+		}
+
+		// Close the session
+		w.client.acpCall("session/close", map[string]any{"sessionId": w.SessionID})
+
+		// Save session state
+		saveSessionState(b.learnerDir, w.Cwd, &sessionState{
+			SessionID:      w.SessionID,
+			TranscriptPath: transcriptPath,
+			Cwd:            w.Cwd,
+		})
+
+		// Format and store result
+		output := formatResult(res.notifs)
+		w.Result = output
+		w.Status = "done"
+		w.DoneAt = time.Now()
+
+		b.pool.put(w.client)
+		log.Printf("async worker %s done: reason=%s, output=%d chars", w.ID, promptResult.StopReason, len(output))
+
+	case <-ctx.Done():
+		// Context cancelled (kill requested)
+		w.client.acpCall("session/close", map[string]any{"sessionId": w.SessionID})
+		b.pool.discard(w.client)
+
+		w.Status = "killed"
+		w.Error = "cancelled"
+		w.DoneAt = time.Now()
+		log.Printf("async worker %s killed", w.ID)
+	}
+}
+
+// workerStatus returns the status of an async worker.
+func (b *acpBridge) workerStatus(workerID string) (string, error) {
+	b.workerMu.Lock()
+	worker, ok := b.workers[workerID]
+	b.workerMu.Unlock()
+
+	if !ok {
+		return "", fmt.Errorf("worker %q not found", workerID)
+	}
+
+	var status strings.Builder
+	fmt.Fprintf(&status, "[%s] %s", worker.ID, worker.Status)
+	fmt.Fprintf(&status, "\nTask: %s", truncateString(worker.Task, 100))
+	fmt.Fprintf(&status, "\nCwd: %s", worker.Cwd)
+	fmt.Fprintf(&status, "\nStarted: %s", worker.StartedAt.Format(time.RFC3339))
+
+	if worker.Status == "running" {
+		elapsed := time.Since(worker.StartedAt)
+		fmt.Fprintf(&status, "\nElapsed: %s", elapsed.Round(time.Second))
+	} else {
+		fmt.Fprintf(&status, "\nDuration: %s", worker.DoneAt.Sub(worker.StartedAt).Round(time.Second))
+	}
+
+	if worker.Status == "done" {
+		fmt.Fprintf(&status, "\nResult:\n%s", worker.Result)
+	} else if worker.Status == "failed" {
+		fmt.Fprintf(&status, "\nError: %s", worker.Error)
+	}
+
+	return status.String(), nil
+}
+
+// truncateString truncates a string to maxLen, adding "..." if truncated.
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen-3] + "..."
 }
 
 // ─── Result formatting ──────────────────────────────────────────────────
