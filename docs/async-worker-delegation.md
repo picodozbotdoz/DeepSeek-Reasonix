@@ -2,11 +2,57 @@
 
 Fire-and-forget delegation for multi-worker scenarios in Reasonix.
 
-## Overview
+## Quick Start for Manager
 
-The ACP bridge now supports async worker delegation, allowing the manager to start multiple workers without blocking and check their status later. This avoids context window pollution from blocking delegation.
+### 1. Configure Workers in reasonix.toml
 
-## Tools
+```toml
+[[plugins]]
+name = "worker-1"
+command = "reasonix-plugin-acp-bridge"
+args = ["-learner-dir", "./workers/worker-1", "-pool-max-total", "2"]
+
+[[plugins]]
+name = "worker-2"
+command = "reasonix-plugin-acp-bridge"
+args = ["-learner-dir", "./workers/worker-2", "-pool-max-total", "2"]
+
+[[plugins]]
+name = "worker-3"
+command = "reasonix-plugin-acp-bridge"
+args = ["-learner-dir", "./workers/worker-3", "-pool-max-total", "2"]
+```
+
+### 2. Create Worker Config (Optional)
+
+Create `<learnerDir>/worker.toml` for each worker:
+
+```toml
+# workers/worker-1/worker.toml
+description = "Backend implementation worker"
+heartbeat_interval = "2m"
+dead_timeout = "5m"
+```
+
+### 3. Use the Tools
+
+```
+# Start workers without blocking
+delegate_task_async(task="Implement auth module") → worker-1
+delegate_task_async(task="Implement API layer") → worker-2
+delegate_task_async(task="Write tests") → worker-3
+
+# Check status later
+worker_status(worker_id="worker-1") → running/done/failed
+
+# List all workers
+worker_list → shows all active workers
+
+# Kill stuck worker
+worker_kill(worker_id="worker-1") → killed
+```
+
+## Tools Reference
 
 ### delegate_task_async
 
@@ -17,7 +63,7 @@ Start a worker task without blocking. Returns a worker ID immediately.
   "name": "delegate_task_async",
   "arguments": {
     "task": "Implement feature X",
-    "cwd": "/path/to/worker/workspace"
+    "cwd": "/path/to/worker/workspace"  // optional
   }
 }
 ```
@@ -61,6 +107,34 @@ Result:
 Feature X implemented successfully...
 ```
 
+### worker_list
+
+List all background workers and their status.
+
+```json
+{
+  "name": "worker_list",
+  "arguments": {}
+}
+```
+
+**Response:**
+```
+Background workers (3):
+
+[worker-1] running
+  Task: Implement auth module
+  Elapsed: 32s
+  Heartbeat: OK (last: 12s ago)
+[worker-2] done
+  Task: Implement API layer
+  Duration: 45s
+[worker-3] running
+  Task: Write tests
+  Elapsed: 15s
+  Heartbeat: OK (last: 8s ago)
+```
+
 ### worker_kill
 
 Kill a running background worker.
@@ -87,9 +161,7 @@ Kill a running background worker.
 reasonix-plugin-acp-bridge \
   -learner-dir ./worker \
   -pool-max-total 3 \          # Max concurrent ACP processes
-  -task-timeout 30m \          # Per-task timeout
-  -heartbeat-interval 5m \     # Heartbeat ping interval (future)
-  -dead-timeout 10m            # Kill if no response (future)
+  -task-timeout 30m            # Per-task timeout
 ```
 
 ### reasonix.toml (Multiple Workers)
@@ -98,17 +170,7 @@ reasonix-plugin-acp-bridge \
 [[plugins]]
 name = "worker-1"
 command = "reasonix-plugin-acp-bridge"
-args = ["-learner-dir", "./workers/worker-1"]
-
-[[plugins]]
-name = "worker-2"
-command = "reasonix-plugin-acp-bridge"
-args = ["-learner-dir", "./workers/worker-2"]
-
-[[plugins]]
-name = "worker-3"
-command = "reasonix-plugin-acp-bridge"
-args = ["-learner-dir", "./workers/worker-3"]
+args = ["-learner-dir", "./workers/worker-1", "-pool-max-total", "2"]
 ```
 
 ### worker.toml (Per-Worker Config)
@@ -129,71 +191,28 @@ dead_timeout = "5m"
 
 Set `heartbeat_interval = "0"` to disable heartbeat monitoring.
 
-## How It Works
-
-### Async Delegation Flow
-
-```
-Manager                          ACP Bridge                      Worker
-   |                                |                               |
-   |-- delegate_task_async(task) -->|                               |
-   |<-- worker_id: worker-1 --------|                               |
-   |                                |-- start ACP process -------->|
-   |                                |-- session/new -------------->|
-   |                                |-- session/prompt(task) ----->|
-   |                                |                               |
-   |   (manager continues)          |   (worker runs in background) |
-   |                                |                               |
-   |-- worker_status(worker-1) --->|                               |
-   |<-- running, elapsed: 32s ------|                               |
-   |                                |                               |
-   |-- worker_status(worker-1) --->|                               |
-   |<-- done, result: ... ----------|<-- session/close ------------|
-```
-
-### Heartbeat Monitoring
-
-Every 5 minutes, the bridge pings each running worker to check if it's alive:
-
-```
-heartbeatMonitor():
-  every 5m:
-    if worker dead (no response in 10m):
-      kill worker
-      mark as "killed"
-    else:
-      send heartbeat ping
-      update LastResponse timestamp
-```
-
-### Dead Detection
-
-If a worker doesn't respond within 10 minutes, it's automatically killed:
-
-```go
-if time.Since(lastResponse) > deadTimeout {
-    log.Printf("heartbeat: worker %s dead, killing", w.ID)
-    w.cancel()  // cancels ACP session
-}
-```
-
-## Usage Examples
+## Manager Workflow
 
 ### Parallel Feature Implementation
 
 ```
-# Start 3 workers for different features
+# 1. Start multiple workers
 delegate_task_async(task="Implement auth module") → worker-1
 delegate_task_async(task="Implement API layer") → worker-2
 delegate_task_async(task="Write tests") → worker-3
 
-# Check status periodically
+# 2. Continue with other work (no blocking)
+
+# 3. Check status periodically
 worker_status(worker_id="worker-1") → running
 worker_status(worker_id="worker-2") → running
 worker_status(worker_id="worker-3") → done
 
-# Get result when done
+# 4. Get result when done
 worker_status(worker_id="worker-3") → Result: Tests written...
+
+# 5. Collect all results
+worker_list → see all workers and their status
 ```
 
 ### Kill Stuck Worker
@@ -207,6 +226,21 @@ worker_kill(worker_id="worker-1") → killed
 
 # Start fresh
 delegate_task_async(task="Implement auth module (retry)") → worker-4
+```
+
+### Monitor Long-Running Tasks
+
+```
+# Start a complex task
+delegate_task_async(task="Refactor entire codebase") → worker-1
+
+# Check periodically
+worker_status(worker_id="worker-1") → running (elapsed: 5m)
+worker_status(worker_id="worker-1") → running (elapsed: 10m)
+worker_status(worker_id="worker-1") → done (duration: 12m)
+
+# Get result
+worker_status(worker_id="worker-1") → Result: Refactoring complete...
 ```
 
 ## Context Window Impact
@@ -229,53 +263,32 @@ The ACP pool limits concurrent workers per bridge process:
 
 For maximum concurrency, declare multiple plugins in `reasonix.toml` rather than increasing pool size. This provides process isolation and avoids shared pool contention.
 
+## Heartbeat Monitoring
+
+Every `heartbeat_interval` (default 5m), the bridge pings each running worker:
+
+```
+heartbeatMonitor():
+  every heartbeat_interval:
+    if worker dead (no response in dead_timeout):
+      kill worker
+      mark as "killed"
+    else:
+      send heartbeat ping
+      update LastResponse timestamp
+```
+
 ## Limitations
 
-1. **ACP session state**: Workers maintain session state across calls. Heartbeat pings may interfere with worker's actual task (future: filter `__heartbeat__` prompts).
+1. **ACP session state**: Workers maintain session state across calls. Heartbeat pings may interfere with worker's actual task.
 
 2. **Pool exhaustion**: Too many concurrent workers may exhaust system resources. Monitor RSS usage.
 
 3. **No auto-restart**: Dead workers are killed but not restarted. Future: configurable restart policy.
 
-## Implementation Details
-
-### Files Modified
-
-- `cmd/reasonix-plugin-acp-bridge/main.go` — Added async worker infrastructure
-
-### Key Structures
-
-```go
-type asyncWorker struct {
-    ID            string
-    Task          string
-    Cwd           string
-    Status        string     // "running", "done", "failed", "killed"
-    Result        string
-    Error         string
-    StartedAt     time.Time
-    DoneAt        time.Time
-    SessionID     string
-    client        *acpClient
-    cancel        context.CancelFunc
-    mu            sync.Mutex // protects concurrent access
-    LastHeartbeat time.Time
-    LastResponse  time.Time
-    HeartbeatOK   bool
-}
-```
-
-### Configuration Defaults
-
-```go
-heartbeatInterval = 5 * time.Minute
-deadTimeout       = 10 * time.Minute
-```
-
 ## Future Work
 
-1. **Configurable heartbeat/dead timeout** via `worker.toml` or CLI flags
-2. **Auto-restart policy** for dead workers
-3. **Worker output streaming** (real-time progress)
-4. **Worker list tool** to see all active workers
-5. **Heartbeat filtering** in worker to ignore `__heartbeat__` prompts
+1. **Auto-restart policy** for dead workers with exponential backoff
+2. **Worker output streaming** (real-time progress)
+3. **Heartbeat filtering** in worker to ignore `__heartbeat__` prompts
+4. **Manager integration** with agent-level tools for delegation workflow
