@@ -75,6 +75,7 @@ type toolSourceConnector struct {
 	install  func(context.Context) (string, error)
 	webFetch func(context.Context) (string, error)
 	lsp      func(context.Context) (string, error)
+	codegraph func(context.Context) (string, error)
 	mcp      func(context.Context, string) (string, error)
 	mcpNames []string
 }

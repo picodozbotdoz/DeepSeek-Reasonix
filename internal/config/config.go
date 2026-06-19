@@ -14,6 +14,8 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/BurntSushi/toml"
 
@@ -22,6 +24,68 @@ import (
 )
 
 var validSkillName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$`)
+
+// ─── Config cache (avoids redundant disk reads at scale) ─────────────────
+
+const configCacheTTL = 60 * time.Second
+
+type configCacheEntry struct {
+	cfg     *Config
+	loaded  time.Time
+	rootKey string // resolved root for this entry
+}
+
+var (
+	configCacheMu sync.RWMutex
+	configCache   map[string]*configCacheEntry // keyed by resolved root
+)
+
+func init() {
+	configCache = make(map[string]*configCacheEntry)
+}
+
+// invalidateConfigCache clears the in-memory config cache. Called after writes
+// so subsequent Load() calls see the fresh on-disk state.
+func invalidateConfigCache() {
+	configCacheMu.Lock()
+	configCache = make(map[string]*configCacheEntry)
+	configCacheMu.Unlock()
+}
+
+// ResetConfigCache is the exported version for tests: it clears the config
+// cache so tests don't leak state across runs.
+func ResetConfigCache() {
+	invalidateConfigCache()
+}
+
+// configCacheKey returns a cache key that includes the resolved root, working
+// directory, and HOME so tests that change environment variables don't hit each
+// other's cache entries.
+func configCacheKey(root string) string {
+	wd, _ := os.Getwd()
+	home := os.Getenv("HOME")
+	return root + "\x00" + wd + "\x00" + home
+}
+
+// cachedConfig returns a cached Config if fresh, nil otherwise. Caller holds no lock.
+func cachedConfig(rootKey string) *Config {
+	key := configCacheKey(rootKey)
+	configCacheMu.RLock()
+	e, ok := configCache[key]
+	configCacheMu.RUnlock()
+	if !ok || time.Since(e.loaded) > configCacheTTL {
+		return nil
+	}
+	return e.cfg
+}
+
+// setConfigCache stores a freshly loaded Config in the cache.
+func setConfigCache(rootKey string, cfg *Config) {
+	key := configCacheKey(rootKey)
+	configCacheMu.Lock()
+	configCache[key] = &configCacheEntry{cfg: cfg, loaded: time.Now(), rootKey: key}
+	configCacheMu.Unlock()
+}
 
 // IsValidSkillName reports whether name is a usable skill identifier.
 func IsValidSkillName(name string) bool { return validSkillName.MatchString(name) }
@@ -55,9 +119,13 @@ type Config struct {
 	Network          NetworkConfig       `toml:"network"`
 	Plugins          []PluginEntry       `toml:"plugins"`
 	Skills           SkillsConfig        `toml:"skills"`
+	Codegraph        CodegraphConfig     `toml:"codegraph"`
+	BuiltInMCP       BuiltInMCPConfig    `toml:"builtin_mcp"`
 	Statusline       StatuslineConfig    `toml:"statusline"`
 	LSP              LSPConfig           `toml:"lsp"`
 	Bot              BotConfig           `toml:"bot"`
+	CAHooks          CAHooksConfig       `toml:"cahooks"`
+	Clarify          ClarifyConfig       `toml:"clarify"`
 
 	providerSources          map[string]providerSourceScope
 	shadowedProjectProviders []ProviderEntry
@@ -326,6 +394,19 @@ func (c *Config) ColdResumePruneEnabled() bool {
 	return *c.Agent.ColdResumePrune
 }
 
+// ClarifyModel returns the configured clarify model ref, or "" for default.
+// Prefers the top-level [clarify] section's model over the legacy
+// [agent] clarify_model field.
+func (c *Config) ClarifyModel() string {
+	if c == nil {
+		return ""
+	}
+	if m := strings.TrimSpace(c.Clarify.Model); m != "" {
+		return m
+	}
+	return strings.TrimSpace(c.Agent.ClarifyModel)
+}
+
 // ReasoningLanguage normalizes agent.reasoning_language. Empty means auto:
 // visible reasoning follows the conversation language already described by the
 // stable LanguagePolicy. Legacy "default" is treated as auto.
@@ -397,6 +478,186 @@ type LSPServer struct {
 // status data row. A JSON payload (model, context tokens, cwd) is fed on stdin.
 type StatuslineConfig struct {
 	Command string `toml:"command"`
+}
+
+// CodegraphConfig governs the built-in CodeGraph MCP server — symbol/call-graph
+// code intelligence (tree-sitter + SQLite) that gives the agent codegraph_*
+// search / context / explore / trace / node tools. Enabled defaults to true so
+// upgrades keep it for existing configs; first-run scaffolds write enabled =
+// false so only brand-new users start without it. AutoInstall (default true)
+// lets reasonix fetch the CodeGraph runtime into its cache when CodeGraph is
+// enabled but missing; set false to require an explicit `reasonix codegraph
+// install` (e.g. for air-gapped or headless runs). Path overrides binary
+// resolution; empty resolves the cache, then a `codegraph` on PATH, then a
+// bundle beside the executable. CodeGraph always starts in the background when
+// enabled; legacy tier values are ignored and removed during config load.
+type CodegraphConfig struct {
+	Enabled     bool   `toml:"enabled"`
+	AutoInstall bool   `toml:"auto_install"`
+	Path        string `toml:"path"`
+	Tier        string `toml:"tier"`
+	ProjectRoot string `toml:"project_root"`
+}
+
+func (c CodegraphConfig) ShouldAutoStart() bool {
+	return c.Enabled
+}
+
+func (c CodegraphConfig) ResolvedTier() string {
+	return "background"
+}
+
+// ClarifyConfig controls the prompt refinement feature (Clarify). It has two
+// sub-modes: Fresh (prefix-stable, optionally with fixed-size history) and
+// Context (full session-aware, no prefix cache). Each sub-mode has its own
+// system prompt and instruction; empty values fall back to built-in defaults.
+type ClarifyConfig struct {
+	// Model optionally names a provider/model for clarification. Empty = use
+	// the active session's model.
+	Model   string            `toml:"model"`
+	Fresh   ClarifyFreshMode  `toml:"fresh"`
+	Context ClarifyContextMode `toml:"context"`
+}
+
+// ClarifyFreshMode is the prefix-stable clarification mode. The request uses a
+// fresh provider.Request with a stable prefix (system prompt + instruction +
+// fixed-size history) followed by the user's draft. max_history_pairs controls
+// how many conversation pairs are included; 0 means no history (full cache hits).
+type ClarifyFreshMode struct {
+	Enabled         bool   `toml:"enabled"`
+	SystemPrompt    string `toml:"system_prompt"`
+	Instruction     string `toml:"instruction"`
+	MaxHistoryPairs int    `toml:"max_history_pairs"`
+	// ToolNames, when true, injects available tool names into the instruction
+	// so the refiner can suggest tool-specific prompts.
+	ToolNames bool `toml:"tool_names"`
+	// MaxVersions caps the number of refined versions per call. 0 = default (3).
+	// Valid range: 1–5. Higher values cost more tokens but give more variety.
+	MaxVersions int `toml:"max_versions"`
+	// MaxTokens caps the model's output tokens per refinement call. 0 = default (1024).
+	// Valid range: 256–4096. Higher values allow longer refinements.
+	MaxTokens int `toml:"max_tokens"`
+}
+
+// ClarifyContextMode is the session-aware clarification mode. The request sends
+// the full session messages (tools results omitted) plus the user's draft. No
+// prefix caching, but full conversation context.
+type ClarifyContextMode struct {
+	Enabled      bool   `toml:"enabled"`
+	SystemPrompt string `toml:"system_prompt"`
+	Instruction  string `toml:"instruction"`
+	// ToolNames, when true, injects available tool names into the instruction
+	// so the refiner can suggest prompts that use specific tools effectively.
+	ToolNames bool `toml:"tool_names"`
+	// MaxVersions caps the number of refined versions per call. 0 = default (3).
+	MaxVersions int `toml:"max_versions"`
+	// MaxTokens caps the model's output tokens per refinement call. 0 = default (1024).
+	MaxTokens int `toml:"max_tokens"`
+}
+
+// DefaultClarifyVersions returns the default number of refined versions.
+const DefaultClarifyVersions = 3
+
+// DefaultClarifyTokens returns the default max output tokens for refinement.
+const DefaultClarifyTokens = 1024
+
+// EffectiveVersions returns the configured version count, clamped to valid range.
+func (m ClarifyFreshMode) EffectiveVersions() int {
+	if m.MaxVersions <= 0 {
+		return DefaultClarifyVersions
+	}
+	if m.MaxVersions > 5 {
+		return 5
+	}
+	if m.MaxVersions < 1 {
+		return 1
+	}
+	return m.MaxVersions
+}
+
+// EffectiveTokens returns the configured max tokens, clamped to valid range.
+func (m ClarifyFreshMode) EffectiveTokens() int {
+	if m.MaxTokens <= 0 {
+		return DefaultClarifyTokens
+	}
+	if m.MaxTokens > 4096 {
+		return 4096
+	}
+	if m.MaxTokens < 256 {
+		return 256
+	}
+	return m.MaxTokens
+}
+
+// EffectiveVersions returns the configured version count, clamped to valid range.
+func (m ClarifyContextMode) EffectiveVersions() int {
+	if m.MaxVersions <= 0 {
+		return DefaultClarifyVersions
+	}
+	if m.MaxVersions > 5 {
+		return 5
+	}
+	if m.MaxVersions < 1 {
+		return 1
+	}
+	return m.MaxVersions
+}
+
+// EffectiveTokens returns the configured max tokens, clamped to valid range.
+func (m ClarifyContextMode) EffectiveTokens() int {
+	if m.MaxTokens <= 0 {
+		return DefaultClarifyTokens
+	}
+	if m.MaxTokens > 4096 {
+		return 4096
+	}
+	if m.MaxTokens < 256 {
+		return 256
+	}
+	return m.MaxTokens
+}
+
+// BuiltInMCPConfig controls Reasonix-shipped MCP servers that require no user
+// server definition. They are off by default and become provider-visible only
+// after the user enables them.
+type BuiltInMCPConfig struct {
+	TimeEnabled     bool `toml:"time_enabled"`
+	Context7Enabled bool `toml:"context7_enabled"`
+}
+
+func (c BuiltInMCPConfig) Enabled(name string) bool {
+	switch name {
+	case "time":
+		return c.TimeEnabled
+	case "context7":
+		return c.Context7Enabled
+	default:
+		return false
+	}
+}
+
+func (c *BuiltInMCPConfig) SetEnabled(name string, enabled bool) bool {
+	switch name {
+	case "time":
+		c.TimeEnabled = enabled
+		return true
+	case "context7":
+		c.Context7Enabled = enabled
+		return true
+	default:
+		return false
+	}
+}
+
+func (c BuiltInMCPConfig) EnabledNames() []string {
+	var out []string
+	if c.TimeEnabled {
+		out = append(out, "time")
+	}
+	if c.Context7Enabled {
+		out = append(out, "context7")
+	}
+	return out
 }
 
 // BotConfig 控制多渠道 IM bot 消息网关。
@@ -491,6 +752,13 @@ type BotConnectionSessionMapping struct {
 	Scope         string `toml:"scope"`
 	WorkspaceRoot string `toml:"workspace_root"`
 	UpdatedAt     string `toml:"updated_at"`
+}
+
+// CAHooksConfig configures Context Analysis Hooks. The actual hook definitions
+// live in .reasonix/cahooks.json; this config section enables/disables the
+// feature and sets global defaults.
+type CAHooksConfig struct {
+	Enabled bool `toml:"enabled"` // master switch; false disables all cahooks
 }
 
 // NetworkConfig controls ordinary outbound HTTP traffic such as model providers,
@@ -768,6 +1036,10 @@ type AgentConfig struct {
 	// ColdResumePrune elides stale tool results when a session reopens past the
 	// provider cache window. nil = default enabled.
 	ColdResumePrune *bool `toml:"cold_resume_prune"`
+	// ClarifyModel optionally names a provider/model for lightweight prompt
+	// refinement (Ctrl+K / /clarify). When empty, refinement uses the active
+	// session's model.
+	ClarifyModel string `toml:"clarify_model"`
 	// PlanModeAllowedTools names tools that are exempt from the plan-mode read-only
 	// gate. When a tool named here is called while in plan mode, it executes without
 	// the "plan mode is read-only" block. Use sparingly — prefer the built-in safe
@@ -1441,6 +1713,12 @@ func Load() (*Config, error) {
 // without changing the process cwd.
 func LoadForRoot(root string) (*Config, error) {
 	root = resolveRoot(root)
+
+	// Check the in-memory cache first to avoid redundant disk reads at scale.
+	if cached := cachedConfig(root); cached != nil {
+		return cached, nil
+	}
+
 	loadDotEnvForRoot(root)
 	cfg := Default()
 	cfg.CredentialsStore = credentialsStoreMode()
@@ -1455,8 +1733,21 @@ func LoadForRoot(root string) (*Config, error) {
 		tomlSources = append(tomlSources, uc)
 	}
 	tomlSources = append(tomlSources, projectTOML)
+
+	// Save user config's credentials_store before merge so project config
+	// cannot override it (credentials_store is a user-level setting).
+	var userCredentialsStore string
+	if uc := userConfigLoadPath(); uc != "" {
+		var tmp Config
+		if _, err := toml.DecodeFile(uc, &tmp); err == nil && tmp.CredentialsStore != "" {
+			userCredentialsStore = tmp.CredentialsStore
+		}
+	}
+
+	sawConfigFile := false
 	for _, path := range tomlSources {
 		if _, err := os.Stat(path); err == nil {
+			sawConfigFile = true
 			if err := migrateLegacyMCPTiersFile(path); err != nil {
 				slog.Warn("config: legacy mcp tier migration failed", "path", path, "err", err)
 			}
@@ -1464,6 +1755,10 @@ func LoadForRoot(root string) (*Config, error) {
 		if err := mergeFile(cfg, path); err != nil {
 			return nil, err
 		}
+	}
+	// Restore user config's credentials_store (project config cannot override it).
+	if userCredentialsStore != "" {
+		cfg.CredentialsStore = userCredentialsStore
 	}
 	// toml.DecodeFile replaces [[plugins]] wholesale, so cfg.Plugins now holds
 	// only the last file's. Re-merge by name across all sources (later wins) so a
@@ -1513,7 +1808,13 @@ func LoadForRoot(root string) (*Config, error) {
 	backfillDeepSeekOfficialPrices(cfg)
 	normalizeEffortConfig(cfg)
 	backfillDeepSeekPro(cfg)
-	cfg.CredentialsStore = credentialsStoreMode()
+	// First run (no config file anywhere): keep CodeGraph off until the user opts
+	// in. An existing config — even one without a [codegraph] section — keeps the
+	// built-in default (on), so an upgrade never silently drops code intelligence.
+	if !sawConfigFile {
+		cfg.Codegraph.Enabled = false
+	}
+	setConfigCache(root, cfg)
 	return cfg, nil
 }
 

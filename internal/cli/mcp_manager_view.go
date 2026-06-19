@@ -70,7 +70,7 @@ func (p *mcpManager) renderList(width int) string {
 		s := p.snapshot.servers[i]
 		group := "User MCPs"
 		if s.BuiltIn {
-			group = "Managed MCPs"
+			group = "Built-in MCPs"
 		}
 		if group != lastGroup {
 			if lastGroup != "" {
@@ -262,7 +262,11 @@ func mcpActionsFor(v mcpServerView, configPath string) []mcpActionItem {
 		out = append(out, mcpActionItem{mcpActionClearAuth, "Clear authentication"})
 	}
 	if v.Status != "disabled" {
-		out = append(out, mcpActionItem{mcpActionDisable, "Disable for this session"})
+		label := "Disable for this session"
+		if v.BuiltIn && v.Name == "codegraph" {
+			label = "Disable"
+		}
+		out = append(out, mcpActionItem{mcpActionDisable, label})
 	}
 	if !v.BuiltIn {
 		out = append(out, mcpActionItem{mcpActionRemove, "Remove server"})
@@ -276,7 +280,11 @@ func appendMCPFailureSecondaryActions(out []mcpActionItem, v mcpServerView, conf
 	}
 	out = appendMCPConfigActions(out, v, configPath)
 	if v.Status != "disabled" {
-		out = append(out, mcpActionItem{mcpActionDisable, "Disable for this session"})
+		label := "Disable for this session"
+		if v.BuiltIn && v.Name == "codegraph" {
+			label = "Disable"
+		}
+		out = append(out, mcpActionItem{mcpActionDisable, label})
 	}
 	if !v.BuiltIn {
 		out = append(out, mcpActionItem{mcpActionRemove, "Remove server"})

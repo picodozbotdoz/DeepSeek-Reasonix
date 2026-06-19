@@ -389,4 +389,17 @@ var ChineseTraditional = Messages{
 	UpgradeApplying:            "正在替換二進位制檔案…",
 	UpgradeApplyFailed:         "應用更新失敗：%v",
 	UpgradeSuccessFmt:          "已更新 %s → %s",
+
+	ClarifyTitle:               "提示詞優化",
+	ClarifyHint:                "↑/↓ 選擇 · Enter 確認 · Ctrl+V 展開 · Esc 保留原樣",
+	ClarifyOriginalLabel:       "原始",
+	ClarifyRefinedFmt:          "優化 %d",
+	ClarifyEmpty:               "沒有可優化的內容——請先輸入提示詞",
+	ClarifyFailedFmt:           "優化失敗：%s",
+	ClarifyCancelled:           "已取消，使用原始提示詞",
+	ClarifyUsage:               "用法：/clarify [--context] <内容>  或 輸入提示詞後按 Ctrl+K（Alt+K 使用上下文）",
+	ClarifyWorking:             "正在優化…",
+	ClarifySelected:            "已選擇優化版本，按 Enter 提交",
+	ClarifyRunRefinedFmt:       "◇ 提示詞已優化\n  優化前：%s\n  優化後：%s",
+	ClarifyRunFailedFmt:        "優化失敗：%s（使用原始提示詞）",
 }

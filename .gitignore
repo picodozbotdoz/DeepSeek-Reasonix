@@ -59,3 +59,9 @@ Thumbs.db
 /site/public/av/
 
 benchmarks/context-maintenance-e2e/run/
+bak/
+*.swp
+*.swo
+# ACP bridge build output
+cmd/reasonix-plugin-acp-bridge/reasonix-plugin-acp-bridge
+/reasonix-plugin-acp-bridge

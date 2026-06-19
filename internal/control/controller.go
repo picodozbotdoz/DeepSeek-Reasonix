@@ -32,6 +32,7 @@ import (
 	"reasonix/internal/agent"
 	"reasonix/internal/billing"
 	"reasonix/internal/checkpoint"
+	"reasonix/internal/clarify"
 	"reasonix/internal/command"
 	"reasonix/internal/config"
 	"reasonix/internal/diff"
@@ -199,6 +200,9 @@ type Controller struct {
 	pendingMemory []string
 
 	displayRecorder func(content, display string)
+
+	clarifyProv provider.Provider // optional lightweight provider for prompt refinement
+	clarifyCfg  config.ClarifyConfig
 }
 
 type approvalReply struct {
@@ -318,6 +322,12 @@ type Options struct {
 	// persist to disk (e.g. "Bash(go test:*)"). The callback is wired into the
 	// permission Gate on EnableInteractiveApproval.
 	OnRemember func(rule string) RememberResult
+	// ClarifyProvider is an optional lightweight provider for prompt refinement
+	// (Ctrl+K / /clarify). When nil, refinement falls back to the session's
+	// executor provider.
+	ClarifyProvider provider.Provider
+	// ClarifyConfig holds the [clarify] config section for both refinement modes.
+	ClarifyConfig config.ClarifyConfig
 	// PlanModeAllowedTools names tools exempt from the plan-mode read-only gate.
 	// Passed through to the executor agent so user-configured exceptions work.
 	PlanModeAllowedTools []string
@@ -373,6 +383,8 @@ func New(opts Options) *Controller {
 		approvals:              map[string]pendingApproval{},
 		asks:                   map[string]pendingAsk{},
 		granted:                map[string]bool{},
+		clarifyProv:            opts.ClarifyProvider,
+		clarifyCfg:             opts.ClarifyConfig,
 	}
 	// Checkpoints: bind a store to the session and route writer pre-edits into it.
 	c.rebindCheckpoints(opts.SessionPath)
@@ -3300,6 +3312,68 @@ func (c *Controller) ForgetMemory(name string) error {
 		"Forgot memory \""+name+"\" — disregard its line still shown in the saved-memories index until next session.")
 	c.refreshMemoryLocked()
 	return nil
+}
+
+// ClarifyPrompt refines the user's input text via a fresh, prefix-stable LLM
+// call (mode 2). Uses ClarifyConfig.Fresh settings for system prompt,
+// instruction, history depth, and tool names.
+func (c *Controller) ClarifyPrompt(ctx context.Context, input string) ([]string, *provider.Usage, error) {
+	if strings.TrimSpace(input) == "" {
+		return nil, nil, fmt.Errorf("nothing to clarify")
+	}
+	if c.clarifyProv == nil {
+		return []string{input}, nil, nil
+	}
+
+	sysPrompt := c.clarifyCfg.Fresh.SystemPrompt
+	instruction := c.clarifyCfg.Fresh.Instruction
+	maxPairs := c.clarifyCfg.Fresh.MaxHistoryPairs
+	toolNames := c.clarifyToolNames(c.clarifyCfg.Fresh.ToolNames)
+	maxVersions := c.clarifyCfg.Fresh.EffectiveVersions()
+	maxTokens := c.clarifyCfg.Fresh.EffectiveTokens()
+
+	// Collect conversation history from the session if maxPairs > 0.
+	var history []provider.Message
+	if maxPairs > 0 && c.executor != nil {
+		history = c.executor.Session().Snapshot()
+	}
+
+	return clarify.RefineFresh(ctx, c.clarifyProv, input, history, "", sysPrompt, instruction, maxPairs, toolNames, maxVersions, maxTokens)
+}
+
+// ClarifyPromptContext refines the user's input text by sending full session
+// context (mode 1). Uses ClarifyConfig.Context settings.
+func (c *Controller) ClarifyPromptContext(ctx context.Context, input string) ([]string, *provider.Usage, error) {
+	if strings.TrimSpace(input) == "" {
+		return nil, nil, fmt.Errorf("nothing to clarify")
+	}
+	if c.clarifyProv == nil {
+		return []string{input}, nil, nil
+	}
+
+	sysPrompt := c.clarifyCfg.Context.SystemPrompt
+	instruction := c.clarifyCfg.Context.Instruction
+	toolNames := c.clarifyToolNames(c.clarifyCfg.Context.ToolNames)
+	maxVersions := c.clarifyCfg.Context.EffectiveVersions()
+	maxTokens := c.clarifyCfg.Context.EffectiveTokens()
+
+	// Collect the full session history for context-aware refinement.
+	var sessionMsgs []provider.Message
+	if c.executor != nil {
+		sessionMsgs = c.executor.Session().Snapshot()
+	}
+
+	return clarify.RefineContextual(ctx, c.clarifyProv, input, sessionMsgs, "", sysPrompt, instruction, toolNames, maxVersions, maxTokens)
+}
+
+// clarifyToolNames returns the list of registered tool names when enabled is
+// true, or nil when disabled. The names are sorted and consistent per session,
+// so they form part of the cache-stable prefix in mode 2.
+func (c *Controller) clarifyToolNames(enabled bool) []string {
+	if !enabled || c.reg == nil {
+		return nil
+	}
+	return c.reg.Names()
 }
 
 // QueueMemory implements memory.Queue: when the model runs the remember/forget

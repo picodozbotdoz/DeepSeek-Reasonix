@@ -12,6 +12,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"reasonix/internal/cahooks"
 	"reasonix/internal/diff"
 	"reasonix/internal/event"
 	"reasonix/internal/evidence"
@@ -82,6 +83,7 @@ var planModeGoWriteOrExecArgs = map[string]bool{
 const maxFinalReadinessBlocks = 3
 const maxEmptyFinalBlocks = 3
 const maxStreamRecoveries = 1
+const maxParallel = 8 // max concurrent goroutines within a single batch or across server groups
 const maxExecutorHandoffNudges = 1
 
 // Renderer redraws the assistant's final-answer text as styled output. It is
@@ -350,6 +352,10 @@ type Agent struct {
 	// stormSig: a model keeps doing the same successful write, so there is no
 	// error for the failure-only storm breaker to see.
 	repeatSuccessCounts map[string]int
+
+	// cah hooks, when non-nil, runs context analysis hooks at various lifecycle
+	// points. nil disables cahooks entirely.
+	cahooks *cahooks.Manager
 }
 
 // KeepPolicy is a bitmask controlling which messages are preserved beyond the
@@ -420,6 +426,9 @@ func (a *Agent) SetMemoryQueue(q memory.Queue) { a.memQueue = q }
 // SetPreEditHook installs the pre-edit snapshot hook (see onPreEdit). The
 // controller wires it to its per-session checkpoint store; nil disables capture.
 func (a *Agent) SetPreEditHook(fn func(diff.Change)) { a.onPreEdit = fn }
+
+// SetCAHooks installs the context analysis hooks manager. nil disables cahooks.
+func (a *Agent) SetCAHooks(m *cahooks.Manager) { a.cahooks = m }
 
 // Session returns the agent's current conversation, useful for persistence
 // hooks that need to read the message log between turns. sessMu serialises this
@@ -794,6 +803,15 @@ func (a *Agent) Run(ctx context.Context, input string) error {
 			if a.steerQueueLen() > 0 {
 				continue
 			}
+			// Fire cahooks before returning
+			if a.cahooks != nil {
+				a.fireCAHooks(ctx, cahooks.TriggerPostTurn, cahooks.State{
+					Turn:          step + 1,
+					ContextUsage:  float64(usage.PromptTokens) / float64(a.contextWindow),
+					HasToolCalls:  usedAnyTool,
+					HasFileChanges: usedAnyTool,
+				})
+			}
 			// A final-answer turn otherwise skips compaction, so a large context
 			// carries into the next turn un-folded and can overflow the model window.
 			// No-op below the trigger, so normal turns keep their warm cache.
@@ -820,6 +838,14 @@ func (a *Agent) Run(ctx context.Context, input string) error {
 	// Only reached when a positive maxSteps guard is configured. The work so far
 	// is already in the session, so the user can just send another message to pick
 	// up where it left off.
+	// Fire cahooks before returning
+	if a.cahooks != nil {
+		a.fireCAHooks(ctx, cahooks.TriggerPostTurn, cahooks.State{
+			Turn:         a.maxSteps,
+			ContextUsage: 1.0, // at max steps, context is likely full
+			HasToolCalls: usedAnyTool,
+		})
+	}
 	return fmt.Errorf("paused after %d tool-call rounds (%s) — the work so far is saved; send another message to continue, or set %s higher or to 0 for no limit", a.maxSteps, a.maxStepsKey, a.maxStepsKey)
 }
 
@@ -1293,15 +1319,9 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) []s
 		results[i] = outcomes[i].output
 	}
 
-	for _, batch := range partitionToolCalls(a.tools, calls) {
-		if batch.parallel && batch.end-batch.start > 1 {
-			runParallel(batch.start, batch.end, run)
-			continue
-		}
-		for i := batch.start; i < batch.end; i++ {
-			run(i)
-		}
-	}
+	batches := partitionToolCalls(a.tools, calls)
+	serverGroups := groupBatchesByServer(batches, calls)
+	runServerGroups(serverGroups, run)
 
 	for i, c := range calls {
 		o := outcomes[i]
@@ -1386,7 +1406,6 @@ func parallelisable(r *tool.Registry, name string) bool {
 }
 
 func runParallel(start, end int, run func(int)) {
-	const maxParallel = 8
 	sem := make(chan struct{}, maxParallel)
 	var wg sync.WaitGroup
 	for i := start; i < end; i++ {
@@ -1400,6 +1419,135 @@ func runParallel(start, end int, run func(int)) {
 		}()
 	}
 	wg.Wait()
+}
+
+// ─── cross-server parallel execution ────────────────────────────────────
+
+// mcpServer extracts the MCP server name from a tool name.
+// "mcp__learner1__delegate_task" → "learner1"
+// Built-in tools return "".
+func mcpServer(name string) string {
+	if !strings.HasPrefix(name, "mcp__") {
+		return ""
+	}
+	rest := strings.TrimPrefix(name, "mcp__")
+	if idx := strings.Index(rest, "__"); idx >= 0 {
+		return rest[:idx]
+	}
+	return rest
+}
+
+// serverGroup holds consecutive tool-call batches that target the same MCP
+// server. Batches within a group run serially (shared connection); different
+// groups run in parallel (separate connections).
+type serverGroup struct {
+	batches []toolCallBatch
+	server  string // MCP server name, "" for built-ins
+}
+
+// groupBatchesByServer merges consecutive serial batches that target the same
+// MCP server into a single group. Parallel (read-only) batches always start a
+// new group since they don't share a connection. Built-in tools (server="")
+// are grouped together as a single serial group.
+func groupBatchesByServer(batches []toolCallBatch, calls []provider.ToolCall) []serverGroup {
+	var groups []serverGroup
+	for _, b := range batches {
+		// Parallel batches always start a new group.
+		if b.parallel {
+			groups = append(groups, serverGroup{batches: []toolCallBatch{b}})
+			continue
+		}
+		server := ""
+		if b.start < len(calls) {
+			server = mcpServer(calls[b.start].Name)
+		}
+		// Try to merge with the last group if same server (including "" for built-ins)
+		// and the last group's last batch is also serial.
+		if len(groups) > 0 {
+			lastGroup := &groups[len(groups)-1]
+			lastBatch := lastGroup.batches[len(lastGroup.batches)-1]
+			lastServer := ""
+			if lastBatch.start < len(calls) {
+				lastServer = mcpServer(calls[lastBatch.start].Name)
+			}
+			if server == lastServer && !lastBatch.parallel {
+				lastGroup.batches = append(lastGroup.batches, b)
+				continue
+			}
+		}
+		groups = append(groups, serverGroup{batches: []toolCallBatch{b}, server: server})
+	}
+	return groups
+}
+
+// runServerGroups executes tool-call batches. Within each group, batches run
+// serially (preserving provider order). Groups with different MCP servers run
+// in parallel since they use separate connections. Built-in tool groups
+// (server="") always run in provider order.
+func runServerGroups(groups []serverGroup, run func(int)) {
+	if len(groups) <= 1 {
+		for _, g := range groups {
+			runGroup(g, run)
+		}
+		return
+	}
+	if !hasDistinctServers(groups) {
+		// All groups target the same (or no) server — run sequentially
+		// so read/write ordering within the single connection is preserved.
+		for _, g := range groups {
+			runGroup(g, run)
+		}
+		return
+	}
+	// Distinct MCP servers: groups use separate connections, so they can run
+	// in parallel without ordering conflicts. Cap concurrency to maxParallel
+	// so a large batch of server calls doesn't spike goroutines.
+	sem := make(chan struct{}, maxParallel)
+	var wg sync.WaitGroup
+	for _, g := range groups {
+		g := g
+		sem <- struct{}{}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			runGroup(g, run)
+		}()
+	}
+	wg.Wait()
+}
+
+// hasDistinctServers returns true when serverGroups span at least two different
+// named MCP servers (server != ""), meaning there are distinct connections that
+// can safely run in parallel. When all groups target the same server or are
+// built-ins (server=""), they share a connection and must run sequentially.
+func hasDistinctServers(groups []serverGroup) bool {
+	var seen string
+	for _, g := range groups {
+		if g.server == "" {
+			continue
+		}
+		if seen == "" {
+			seen = g.server
+		} else if g.server != seen {
+			return true
+		}
+	}
+	return false
+}
+
+// runGroup executes one serverGroup's batches serially (they share a single MCP
+// connection). Within each batch, parallel read-only calls still fan out.
+func runGroup(g serverGroup, run func(int)) {
+	for _, b := range g.batches {
+		if b.parallel && b.end-b.start > 1 {
+			runParallel(b.start, b.end, run)
+		} else {
+			for i := b.start; i < b.end; i++ {
+				run(i)
+			}
+		}
+	}
 }
 
 // stormBreakThreshold is how many times in a row the same tool may fail the same
@@ -1934,4 +2082,12 @@ func finishReasonMessage(u *provider.Usage) (string, bool) {
 	default:
 		return "", false
 	}
+}
+
+// fireCAHooks triggers context analysis hooks at the end of a turn.
+func (a *Agent) fireCAHooks(ctx context.Context, trigger string, state cahooks.State) {
+	if a.cahooks == nil {
+		return
+	}
+	a.cahooks.RunHooks(ctx, trigger, state, a.session.Messages, "")
 }
