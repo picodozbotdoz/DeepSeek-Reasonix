@@ -329,7 +329,7 @@ func (t *TaskTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 					err = errors.Join(panicErr, t.transcripts.SaveFailed(run))
 				}
 			}()
-			answer, err := t.runSubSession(jobCtx, p.Prompt, subReg, nested, maxSteps, prov, pricing, ctxWin, run.Session)
+			answer, err := t.runSubSession(jobCtx, p.Prompt, subReg, nested, maxSteps, prov, pricing, ctxWin, run.Session, t.ProgressContext())
 			if err != nil {
 				return FormatSubagentResult("", run.Ref, true), errors.Join(err, t.transcripts.SaveFailed(run))
 			}
@@ -347,7 +347,7 @@ func (t *TaskTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 
 	// Foreground: run synchronously, nesting events under this call.
 	defer run.Release()
-	answer, err := t.runSubSession(ctx, p.Prompt, subReg, subSink(ctx), maxSteps, prov, pricing, ctxWin, run.Session)
+	answer, err := t.runSubSession(ctx, p.Prompt, subReg, subSink(ctx), maxSteps, prov, pricing, ctxWin, run.Session, t.ProgressContext())
 	if err != nil {
 		return "", errors.Join(err, t.transcripts.SaveFailed(run))
 	}
@@ -512,7 +512,7 @@ func (t *TaskTool) resolveSubSessionRuntime(modelRef, effort string) (provider.P
 	return prov, pricing, ctxWin, nil
 }
 
-func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *tool.Registry, sink event.Sink, maxSteps int, prov provider.Provider, pricing *provider.Pricing, ctxWin int, sess *Session) (string, error) {
+func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *tool.Registry, sink event.Sink, maxSteps int, prov provider.Provider, pricing *provider.Pricing, ctxWin int, sess *Session, progressCtx ...string) (string, error) {
 	return RunSubAgentWithSession(ctx, prov, subReg, sess, prompt, Options{
 		MaxSteps:          maxSteps,
 		Temperature:       t.temperature,
@@ -527,7 +527,7 @@ func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *too
 		ArchiveDir:        t.archiveDir,
 		KeepPolicy:        t.keepPolicy,
 		ReasoningLanguage: ReasoningLanguageFromContext(ctx),
-	}, sink)
+	}, sink, progressCtx...)
 }
 
 func FormatSubagentResult(answer, ref string, failed bool) string {
@@ -546,9 +546,16 @@ func FormatSubagentResult(answer, ref string, failed bool) string {
 // RunSubAgentWithSession continues an existing sub-agent session with prompt and
 // returns the latest final assistant answer. Fresh sub-agents pass a newly-created
 // session; continued sub-agents pass a loaded transcript session.
-func RunSubAgentWithSession(ctx context.Context, prov provider.Provider, reg *tool.Registry, sess *Session, prompt string, opts Options, sink event.Sink) (string, error) {
+// progressCtx, when non-empty, is prepended to the prompt as a user message
+// prefix. This injects progress context without modifying the system prompt,
+// preserving DeepSeek's prefix cache stability.
+func RunSubAgentWithSession(ctx context.Context, prov provider.Provider, reg *tool.Registry, sess *Session, prompt string, opts Options, sink event.Sink, progressCtx ...string) (string, error) {
 	if sess == nil {
 		return "", fmt.Errorf("sub-agent session is nil")
+	}
+	// Prepend progress context to prompt if provided (user message, not system prompt)
+	if len(progressCtx) > 0 && strings.TrimSpace(progressCtx[0]) != "" {
+		prompt = "## Current Progress\n\n" + progressCtx[0] + "\n\n## Task\n\n" + prompt
 	}
 	sub := New(prov, reg, sess, opts, sink)
 	if err := sub.Run(ctx, prompt); err != nil {
