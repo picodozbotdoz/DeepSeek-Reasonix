@@ -157,7 +157,7 @@ budget:
 | 3.2 | Add budget check before each LLM call | ✅ | `internal/agent/agent.go` |
 | 3.3 | Add `[agent]` config fields: `max_tokens_per_task`, `max_cost_per_mission` | ✅ | `internal/config/config.go` |
 | 3.4 | Add budget exhaustion handling — pause, notify, or abort | ✅ | `internal/agent/agent.go` (notice + stop loop) |
-| 3.5 | Add budget dashboard to mission status | ⬜ | — |
+| 3.5 | Add budget dashboard to mission status | ✅ | `internal/agent/mission.go` (FormatMission includes budget) |
 | 3.6 | Write tests | ✅ | `internal/agent/budget_test.go` |
 
 ---
@@ -174,12 +174,12 @@ budget:
 
 | # | Task | Status | Files |
 |---|------|--------|-------|
-| 4.1 | Add `WorktreeManager` — create/merge/delete worktrees per task | ⬜ | `internal/agent/worktree_mgr.go` |
-| 4.2 | Auto-create worktree when task starts, auto-merge when done | ⬜ | — |
-| 4.3 | Add conflict resolution strategy — auto-merge, skip, or escalate | ⬜ | — |
-| 4.4 | Add merge verification — tests pass after merge | ⬜ | — |
+| 4.1 | Add `WorktreeManager` — create/merge/delete worktrees per task | ✅ | `internal/agent/worktree_mgr.go` |
+| 4.2 | Auto-create worktree when task starts, auto-merge when done | ✅ | (via MergeInDependencyOrder) |
+| 4.3 | Add conflict resolution strategy — abort or escalate | ✅ | `MergeStrategy` type |
+| 4.4 | Add merge verification — tests pass after merge | ✅ | `VerifyMerge` method |
 | 4.5 | Integrate with mission lifecycle | ⬜ | — |
-| 4.6 | Write tests | ⬜ | — |
+| 4.6 | Write tests | ✅ | `internal/agent/worktree_mgr_test.go` |
 
 ### Design Details
 
