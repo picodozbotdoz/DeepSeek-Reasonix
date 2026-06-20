@@ -84,12 +84,12 @@ Enable Reasonix to handle SWE tasks spanning days to weeks, using existing primi
 
 | # | Task | Status | Files |
 |---|------|--------|-------|
-| 2.1 | Define mission file format (`MISSION.yaml`) | ⬜ | — |
-| 2.2 | Add `MissionManager` — load, query, update mission state | ⬜ | `internal/agent/mission.go` |
-| 2.3 | Add `mission` tool — manager can create/update/query missions | ⬜ | `internal/agent/mission_tool.go` |
+| 2.1 | Define mission file format (`MISSION.toml`) | ✅ | `internal/agent/mission.go`, `mission_toml.go` |
+| 2.2 | Add `MissionManager` — load, query, update mission state | ✅ | `internal/agent/mission.go` |
+| 2.3 | Add `mission` tool — manager can create/update/query missions | ✅ | `internal/agent/mission_tool.go` |
 | 2.4 | Integrate with `parallel_tasks` — mission tasks auto-dispatch | ⬜ | `internal/agent/parallel_tasks.go` |
 | 2.5 | Add mission status dashboard (CLI + desktop) | ⬜ | — |
-| 2.6 | Write tests | ⬜ | — |
+| 2.6 | Write tests | ✅ | `internal/agent/mission_test.go` |
 
 ### Mission File Format
 
