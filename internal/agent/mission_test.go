@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"reasonix/internal/event"
 )
 
 func TestMissionCreateAndLoad(t *testing.T) {
@@ -459,4 +461,101 @@ func TestMissionTomlRoundTrip(t *testing.T) {
 	if parsed.Budget.MaxTokens != 1000000 {
 		t.Errorf("budget.max_tokens = %d, want 1000000", parsed.Budget.MaxTokens)
 	}
+}
+
+// --- Threat 1: Prefix Cache Stability Tests ---
+
+func TestMissionToolStatusReturnsCompactSummary(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "MISSION.toml")
+	mm := NewMissionManager(path)
+
+	mm.CreateMission("Test Mission", []MissionTask{
+		{ID: "T1", Title: "First task with a very long title that would be verbose in a tool result", Status: TaskDone},
+		{ID: "T2", Title: "Second task", Status: TaskInProgress},
+		{ID: "T3", Title: "Third task", Status: TaskPending},
+	})
+
+	tool := NewMissionTool(mm, nil)
+	result, err := tool.Execute(nil, []byte(`{"action":"status"}`))
+	if err != nil {
+		t.Fatalf("status: %v", err)
+	}
+
+	// Result should be compact (one line), not full FormatMission output
+	if strings.Contains(result, "## Tasks") {
+		t.Errorf("status result contains full task details — should be compact summary:\n%s", result)
+	}
+	if strings.Contains(result, "done_when:") {
+		t.Errorf("status result contains done_when details — should be compact:\n%s", result)
+	}
+	// Should contain the summary format
+	if !strings.Contains(result, "tasks:") {
+		t.Errorf("status result should contain task count summary:\n%s", result)
+	}
+	// Compact summary should be under 200 chars
+	if len(result) > 200 {
+		t.Errorf("status result too long (%d chars) — should be compact:\n%s", len(result), result)
+	}
+}
+
+func TestMissionToolStatusEmitsNotice(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "MISSION.toml")
+	mm := NewMissionManager(path)
+
+	mm.CreateMission("Test Mission", []MissionTask{
+		{ID: "T1", Title: "Task 1", Status: TaskDone},
+	})
+
+	var notices []string
+	sink := funcSink(func(e event.Event) {
+		if e.Kind == event.Notice {
+			notices = append(notices, e.Text)
+		}
+	})
+
+	tool := NewMissionTool(mm, sink)
+	tool.Execute(nil, []byte(`{"action":"status"}`))
+
+	if len(notices) == 0 {
+		t.Fatal("status should emit a Notice event for UI display")
+	}
+	// Notice should contain full formatted mission
+	if !strings.Contains(notices[0], "Test Mission") {
+		t.Errorf("notice should contain mission name, got: %s", notices[0])
+	}
+	if !strings.Contains(notices[0], "## Tasks") {
+		t.Errorf("notice should contain full task details, got: %s", notices[0])
+	}
+}
+
+func TestMissionToolReadyReturnsCompactSummary(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "MISSION.toml")
+	mm := NewMissionManager(path)
+
+	mm.CreateMission("Test", []MissionTask{
+		{ID: "T1", Title: "Task with a very long title that would take up lots of space in a tool result if returned in full", DoneWhen: "tests pass and lint is clean"},
+		{ID: "T2", Title: "Task 2", DependsOn: []string{"T1"}},
+	})
+
+	tool := NewMissionTool(mm, nil)
+	result, err := tool.Execute(nil, []byte(`{"action":"ready"}`))
+	if err != nil {
+		t.Fatalf("ready: %v", err)
+	}
+
+	// Should be compact — just task IDs
+	if strings.Contains(result, "done_when:") {
+		t.Errorf("ready result contains done_when — should be compact:\n%s", result)
+	}
+	if !strings.Contains(result, "T1") {
+		t.Errorf("ready result should contain task ID:\n%s", result)
+	}
+}
+
+// funcSink creates an event sink that calls the given function.
+func funcSink(fn func(event.Event)) event.Sink {
+	return event.FuncSink(fn)
 }
