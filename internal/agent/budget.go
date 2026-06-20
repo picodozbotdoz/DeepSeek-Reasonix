@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 
 	"reasonix/internal/event"
@@ -50,7 +51,7 @@ func (s BudgetStatus) Summary() string {
 	if s.Exceeded() {
 		status = "EXCEEDED"
 	}
-	return fmt.Sprintf("[%s] %s", status, joinParts(parts))
+	return fmt.Sprintf("[%s] %s", status, strings.Join(parts, ", "))
 }
 
 // BudgetTracker provides incremental cost tracking with hard limits.
@@ -153,15 +154,4 @@ func computeCost(usage *provider.Usage, pricing *provider.Pricing) float64 {
 	inputCost := float64(usage.PromptTokens) * pricing.Input / 1_000_000
 	outputCost := float64(usage.CompletionTokens) * pricing.Output / 1_000_000
 	return inputCost + outputCost
-}
-
-func joinParts(parts []string) string {
-	result := ""
-	for i, p := range parts {
-		if i > 0 {
-			result += ", "
-		}
-		result += p
-	}
-	return result
 }

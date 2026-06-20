@@ -945,6 +945,17 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	}
 
 	execSess := agent.NewSession(sysPrompt)
+
+	// Create budget tracker if any budget limits are configured.
+	var budgetTracker *agent.BudgetTracker
+	if cfg.Agent.MaxTokensPerTask > 0 || cfg.Agent.MaxCostPerMission > 0 || cfg.Agent.MaxTurnsPerTask > 0 {
+		budgetTracker = agent.NewBudgetTracker(agent.BudgetLimits{
+			MaxTokens:  cfg.Agent.MaxTokensPerTask,
+			MaxCostUSD: cfg.Agent.MaxCostPerMission,
+			MaxTurns:   cfg.Agent.MaxTurnsPerTask,
+		})
+	}
+
 	executor := agent.New(execProv, reg, execSess, agent.Options{
 		MaxSteps:             maxSteps,
 		Temperature:          cfg.Agent.Temperature,
@@ -962,6 +973,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		KeepPolicy:           keepPolicy,
 		ReasoningLanguage:    cfg.ReasoningLanguage(),
 		PlanModeAllowedTools: cfg.Agent.PlanModeAllowedTools,
+		Budget:               budgetTracker,
 	}, sink)
 
 	// Wire cahooks if enabled
@@ -1081,6 +1093,27 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		},
 		ClarifyProvider: clarifyProv,
 		ClarifyConfig:   cfg.Clarify,
+	}
+
+	// Wire budget tracker into controller options.
+	if budgetTracker != nil {
+		ctrlOpts.Budget = budgetTracker
+	}
+
+	// Wire progress file for long-running task tracking.
+	if root != "" {
+		sharedDir := filepath.Join(root, "_shared")
+		if _, err := os.Stat(sharedDir); err == nil {
+			pf := agent.NewProgressFile(sharedDir)
+			ctrlOpts.Progress = pf
+		}
+	}
+
+	// Wire mission manager for long-running task orchestration.
+	if root != "" {
+		sharedDir := filepath.Join(root, "_shared")
+		missionPath := filepath.Join(sharedDir, "MISSION.toml")
+		ctrlOpts.Mission = agent.NewMissionManager(missionPath)
 	}
 	if classifier != nil {
 		ctrlOpts.Classifier = classifier

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"strings"
 	"testing"
 
 	"reasonix/internal/event"
@@ -168,7 +169,7 @@ func TestBudgetStatusSummary(t *testing.T) {
 		t.Error("Summary should not be empty")
 	}
 	// Should contain token info
-	if !containsSubstring(summary, "500/1000") {
+	if !strings.Contains(summary, "500/1000") {
 		t.Errorf("Summary should contain token count, got: %s", summary)
 	}
 }
@@ -187,7 +188,7 @@ func TestBudgetStatusSummaryExceeded(t *testing.T) {
 
 	status := bt.Check()
 	summary := status.Summary()
-	if !containsSubstring(summary, "EXCEEDED") {
+	if !strings.Contains(summary, "EXCEEDED") {
 		t.Errorf("Summary should contain EXCEEDED, got: %s", summary)
 	}
 }

@@ -343,6 +343,9 @@ type Options struct {
 	// Mission is the optional mission manager for long-running task orchestration.
 	// When set, /mission reads and displays the current mission state.
 	Mission *agent.MissionManager
+	// Budget is the optional budget tracker for resource usage enforcement.
+	// When set, the agent loop checks limits before each LLM call.
+	Budget *agent.BudgetTracker
 }
 
 // New builds a Controller. A nil Sink is replaced with event.Discard.

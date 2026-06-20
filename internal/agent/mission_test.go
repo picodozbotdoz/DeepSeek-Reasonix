@@ -2,6 +2,7 @@ package agent
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -129,7 +130,7 @@ func TestMissionFormatMission(t *testing.T) {
 	}
 	// Should contain key info
 	for _, want := range []string{"Test Mission", "T1", "First task", "T2", "worker-1", "tests pass"} {
-		if !containsString(formatted, want) {
+		if !strings.Contains(formatted, want) {
 			t.Errorf("FormatMission missing %q", want)
 		}
 	}
@@ -458,17 +459,4 @@ func TestMissionTomlRoundTrip(t *testing.T) {
 	if parsed.Budget.MaxTokens != 1000000 {
 		t.Errorf("budget.max_tokens = %d, want 1000000", parsed.Budget.MaxTokens)
 	}
-}
-
-func containsString(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsSubstring(s, substr))
-}
-
-func containsSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
