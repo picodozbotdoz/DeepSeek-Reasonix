@@ -133,6 +133,7 @@ func (c *Config) SetLanguage(lang string) error {
 	default:
 		return fmt.Errorf("language %q: must be auto|en|zh", lang)
 	}
+	c.ApplyDeepSeekOfficialDefaultPricing()
 	return nil
 }
 
@@ -165,6 +166,7 @@ func (c *Config) SetDesktopLanguage(lang string) error {
 	default:
 		return fmt.Errorf("desktop language %q: must be auto|en|zh", lang)
 	}
+	c.ApplyDeepSeekOfficialDefaultPricing()
 	return nil
 }
 
@@ -190,6 +192,20 @@ func (c *Config) SetDesktopAppearance(theme, style string) error {
 		return fmt.Errorf("desktop theme style %q: must be graphite|aurora|slate|carbon|nocturne|amber", style)
 	}
 	c.Desktop.ThemeStyle = normalized
+	return nil
+}
+
+// SetDesktopLayoutStyle sets the desktop layout style. UI-only; it must not
+// affect CLI output or provider-visible request data.
+func (c *Config) SetDesktopLayoutStyle(style string) error {
+	switch strings.ToLower(strings.TrimSpace(style)) {
+	case "", "classic":
+		c.Desktop.LayoutStyle = "classic"
+	case "workbench", "workspace":
+		c.Desktop.LayoutStyle = "workbench"
+	default:
+		return fmt.Errorf("desktop layout style %q: must be classic|workbench", style)
+	}
 	return nil
 }
 
@@ -277,7 +293,7 @@ func (c *Config) SetDesktopTelemetry(enabled bool) error {
 	return nil
 }
 
-// SetDesktopMetrics sets whether the desktop sends opt-in aggregate agent metrics.
+// SetDesktopMetrics sets whether the desktop sends aggregate desktop metrics.
 func (c *Config) SetDesktopMetrics(enabled bool) error {
 	c.Desktop.Metrics = &enabled
 	return nil
@@ -722,7 +738,8 @@ func ClearPluginAuthenticationInSource(name string) (PluginEntry, bool, string, 
 }
 
 func pluginTOMLSourcePath(name string) string {
-	for _, path := range []string{"reasonix.toml", userConfigPath()} {
+	paths := append([]string{"reasonix.toml"}, userConfigCandidatePaths()...)
+	for _, path := range paths {
 		if strings.TrimSpace(path) == "" {
 			continue
 		}
@@ -843,16 +860,27 @@ func renderScopeForPath(path string) RenderScope {
 
 func isUserConfigPath(path string) bool {
 	path = strings.TrimSpace(path)
-	uc := strings.TrimSpace(userConfigPath())
-	if path == "" || uc == "" {
+	if path == "" {
 		return false
 	}
-	pathAbs, pathErr := filepath.Abs(path)
-	ucAbs, ucErr := filepath.Abs(uc)
-	if pathErr == nil && ucErr == nil {
-		return filepath.Clean(pathAbs) == filepath.Clean(ucAbs)
+	for _, uc := range userConfigCandidatePaths() {
+		uc = strings.TrimSpace(uc)
+		if uc == "" {
+			continue
+		}
+		pathAbs, pathErr := filepath.Abs(path)
+		ucAbs, ucErr := filepath.Abs(uc)
+		if pathErr == nil && ucErr == nil {
+			if filepath.Clean(pathAbs) == filepath.Clean(ucAbs) {
+				return true
+			}
+			continue
+		}
+		if filepath.Clean(path) == filepath.Clean(uc) {
+			return true
+		}
 	}
-	return filepath.Clean(path) == filepath.Clean(uc)
+	return false
 }
 
 // Save writes the configuration back to the file it was loaded from

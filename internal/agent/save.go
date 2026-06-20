@@ -15,6 +15,8 @@ import (
 	"reasonix/internal/provider"
 )
 
+const cleanupPendingExt = ".cleanup-pending.json"
+
 // Save writes the session's messages to path in JSONL — one provider.Message
 // per line — so a user can resume the conversation later. The file is
 // rewritten in full on every save: chat sessions are small (kilobytes), and
@@ -94,11 +96,97 @@ type SessionInfo struct {
 	TopicTitle     string
 }
 
-// ListSessions returns every *.jsonl session under dir, most-recently-active
-// first, each with a preview line so the picker can show something the user
-// recognises. A missing directory is not an error — it just means there's
-// nothing to resume yet.
-func ListSessions(dir string) ([]SessionInfo, error) {
+// SessionOrderInfo is the lightweight sidecar/mtime ordering record shared by
+// session pickers and prompt-history navigation. It intentionally avoids reading
+// JSONL content; callers that need previews can layer that on afterwards.
+type SessionOrderInfo struct {
+	Path           string
+	CreatedAt      time.Time
+	LastActivityAt time.Time
+	ModTime        time.Time // compatibility alias for LastActivityAt
+	Scope          string
+	WorkspaceRoot  string
+	TopicID        string
+	TopicTitle     string
+}
+
+// CleanupPendingMeta records that a session was logically removed but still has
+// artifacts waiting for a background job to unwind before physical cleanup.
+type CleanupPendingMeta struct {
+	Operation string `json:"operation"`
+	CreatedAt int64  `json:"createdAt"`
+}
+
+// CleanupPendingInfo describes one durable delayed-cleanup marker and the
+// session transcript it belongs to.
+type CleanupPendingInfo struct {
+	SessionPath string
+	MarkerPath  string
+	Meta        CleanupPendingMeta
+}
+
+// CleanupPendingPath returns the durable marker path for a session transcript.
+func CleanupPendingPath(sessionPath string) string {
+	sessionPath = strings.TrimSpace(sessionPath)
+	if sessionPath == "" {
+		return ""
+	}
+	return strings.TrimSuffix(sessionPath, ".jsonl") + cleanupPendingExt
+}
+
+// MarkCleanupPending hides a logically removed session from resume/list surfaces
+// until delayed physical cleanup has finished.
+func MarkCleanupPending(sessionPath, operation string) error {
+	path := CleanupPendingPath(sessionPath)
+	if path == "" {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	meta := CleanupPendingMeta{Operation: strings.TrimSpace(operation), CreatedAt: time.Now().UnixMilli()}
+	b, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o644)
+}
+
+// ClearCleanupPending removes a delayed-cleanup marker after physical cleanup.
+func ClearCleanupPending(sessionPath string) error {
+	path := CleanupPendingPath(sessionPath)
+	if path == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// IsCleanupPending reports whether a session is hidden pending delayed cleanup.
+func IsCleanupPending(sessionPath string) bool {
+	path := CleanupPendingPath(sessionPath)
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// IsVisibleSession reports whether a persisted session should appear on normal
+// user/agent-facing list, restore, and retrieval surfaces.
+func IsVisibleSession(sessionPath string) bool {
+	return strings.TrimSpace(sessionPath) != "" && !IsCleanupPending(sessionPath)
+}
+
+// ListCleanupPending returns delayed-cleanup markers left in dir. A missing
+// directory is not an error.
+func ListCleanupPending(dir string) ([]CleanupPendingInfo, error) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return nil, nil
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -106,7 +194,69 @@ func ListSessions(dir string) ([]SessionInfo, error) {
 		}
 		return nil, err
 	}
-	var out []SessionInfo
+	var out []CleanupPendingInfo
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), cleanupPendingExt) {
+			continue
+		}
+		markerPath := filepath.Join(dir, e.Name())
+		var meta CleanupPendingMeta
+		b, err := os.ReadFile(markerPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		if strings.TrimSpace(string(b)) != "" {
+			if err := json.Unmarshal(b, &meta); err != nil {
+				return nil, fmt.Errorf("read cleanup-pending marker %s: %w", markerPath, err)
+			}
+		}
+		name := strings.TrimSuffix(e.Name(), cleanupPendingExt) + ".jsonl"
+		out = append(out, CleanupPendingInfo{
+			SessionPath: filepath.Join(dir, name),
+			MarkerPath:  markerPath,
+			Meta:        meta,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].SessionPath < out[j].SessionPath
+	})
+	return out, nil
+}
+
+// ReconcileCleanupPending retries physical cleanup for leftover delayed-cleanup
+// markers. It keeps going after individual cleanup errors and returns them joined.
+func ReconcileCleanupPending(dir string, cleanup func(CleanupPendingInfo) error) error {
+	pending, err := ListCleanupPending(dir)
+	if err != nil {
+		return err
+	}
+	if cleanup == nil {
+		return nil
+	}
+	var errs []error
+	for _, item := range pending {
+		if err := cleanup(item); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", item.SessionPath, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// ListSessionOrder returns every *.jsonl session under dir in the same
+// most-recently-active order used by ListSessions, using only file metadata and
+// branch sidecars. A missing directory is not an error.
+func ListSessionOrder(dir string) ([]SessionOrderInfo, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var out []SessionOrderInfo
 	for _, e := range entries {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".jsonl" {
 			continue
@@ -116,11 +266,7 @@ func ListSessions(dir string) ([]SessionInfo, error) {
 			continue
 		}
 		full := filepath.Join(dir, e.Name())
-		preview, turns := previewSession(full)
-		if turns == 0 {
-			// Skip sessions that have never had user interaction — they are
-			// empty conversations that should not appear in the history panel
-			// or the resume picker.
+		if !IsVisibleSession(full) {
 			continue
 		}
 		createdAt := info.ModTime()
@@ -141,13 +287,11 @@ func ListSessions(dir string) ([]SessionInfo, error) {
 			topicID = meta.TopicID
 			topicTitle = meta.TopicTitle
 		}
-		out = append(out, SessionInfo{
+		out = append(out, SessionOrderInfo{
 			Path:           full,
 			CreatedAt:      createdAt,
 			LastActivityAt: lastActivityAt,
 			ModTime:        lastActivityAt,
-			Preview:        preview,
-			Turns:          turns,
 			Scope:          scope,
 			WorkspaceRoot:  workspaceRoot,
 			TopicID:        topicID,
@@ -161,6 +305,46 @@ func ListSessions(dir string) ([]SessionInfo, error) {
 		return out[i].LastActivityAt.After(out[j].LastActivityAt)
 	})
 	return out, nil
+}
+
+// ListSessions returns every non-empty *.jsonl session under dir,
+// most-recently-active first, each with a preview line so the picker can show
+// something the user recognises. A missing directory is not an error — it just
+// means there's nothing to resume yet.
+func ListSessions(dir string) ([]SessionInfo, error) {
+	ordered, err := ListSessionOrder(dir)
+	if err != nil {
+		return nil, err
+	}
+	var out []SessionInfo
+	for _, session := range ordered {
+		preview, turns := previewSession(session.Path)
+		if turns == 0 {
+			// Skip sessions that have never had user interaction — they are
+			// empty conversations that should not appear in the history panel
+			// or the resume picker.
+			continue
+		}
+		out = append(out, SessionInfo{
+			Path:           session.Path,
+			CreatedAt:      session.CreatedAt,
+			LastActivityAt: session.LastActivityAt,
+			ModTime:        session.ModTime,
+			Preview:        preview,
+			Turns:          turns,
+			Scope:          session.Scope,
+			WorkspaceRoot:  session.WorkspaceRoot,
+			TopicID:        session.TopicID,
+			TopicTitle:     session.TopicTitle,
+		})
+	}
+	return out, nil
+}
+
+// SessionPreview returns the same preview and user-turn count used by
+// ListSessions for one session file.
+func SessionPreview(path string) (string, int) {
+	return previewSession(path)
 }
 
 // previewSession returns the first user message (truncated) and the number of
