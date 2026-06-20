@@ -617,8 +617,25 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			taskModel, taskEffort, resolveSubagentProvider).
 			WithTranscripts(subagentStore, root, modelName, entry.Effort).
 			WithTranscriptIdentityResolver(subagentIdentity)
+
+		// Wire progress file into task tool if available.
+		if root != "" {
+			sharedDir := filepath.Join(root, "_shared")
+			if _, err := os.Stat(sharedDir); err == nil {
+				tt.WithProgress(agent.NewProgressFile(sharedDir))
+			}
+		}
+
 		reg.Add(tt)
 		reg.Add(agent.NewParallelTasksTool(tt, reg))
+
+		// Wire mission tool if shared directory exists.
+		if root != "" {
+			sharedDir := filepath.Join(root, "_shared")
+			missionPath := filepath.Join(sharedDir, "MISSION.toml")
+			reg.Add(agent.NewMissionTool(agent.NewMissionManager(missionPath)))
+		}
+
 		return "enabled task."
 	}
 	if !tokenEconomy {
