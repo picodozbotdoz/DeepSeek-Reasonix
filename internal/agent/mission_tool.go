@@ -6,17 +6,21 @@ import (
 	"fmt"
 	"strings"
 
+	"reasonix/internal/event"
 	"reasonix/internal/tool"
 )
 
 // MissionTool lets the manager create, query, and update missions.
+// It emits detailed state as Notice events (UI only) and returns compact
+// summaries as tool results to preserve prefix cache stability.
 type MissionTool struct {
 	manager *MissionManager
+	sink    event.Sink
 }
 
 // NewMissionTool builds the mission management tool.
-func NewMissionTool(manager *MissionManager) tool.Tool {
-	return &MissionTool{manager: manager}
+func NewMissionTool(manager *MissionManager, sink event.Sink) tool.Tool {
+	return &MissionTool{manager: manager, sink: sink}
 }
 
 func (*MissionTool) Name() string   { return "mission" }
@@ -159,15 +163,18 @@ func (t *MissionTool) Execute(_ context.Context, raw json.RawMessage) (string, e
 		if len(ready) == 0 {
 			return "No tasks ready to execute. All pending tasks have unmet dependencies.", nil
 		}
-		var b strings.Builder
-		fmt.Fprintf(&b, "%d task(s) ready to execute:\n\n", len(ready))
+		// Emit detailed list as Notice (UI only)
+		var detail strings.Builder
+		fmt.Fprintf(&detail, "%d task(s) ready to execute:\n\n", len(ready))
 		for _, task := range ready {
-			fmt.Fprintf(&b, "  %s — %s\n", task.ID, task.Title)
+			fmt.Fprintf(&detail, "  %s — %s\n", task.ID, task.Title)
 			if task.DoneWhen != "" {
-				fmt.Fprintf(&b, "    done_when: %s\n", task.DoneWhen)
+				fmt.Fprintf(&detail, "    done_when: %s\n", task.DoneWhen)
 			}
 		}
-		return b.String(), nil
+		t.emitNotice(detail.String())
+		// Return compact summary for model
+		return fmt.Sprintf("%d task(s) ready: %s", len(ready), readyTaskIDs(ready)), nil
 
 	case "dispatch":
 		ready, err := t.manager.ReadyTasks()
@@ -199,9 +206,29 @@ func (t *MissionTool) Execute(_ context.Context, raw json.RawMessage) (string, e
 		if mission.Name == "" {
 			return "No mission configured. Use 'create' to start a new mission.", nil
 		}
-		return mission.FormatMission(), nil
+		// Emit full state as Notice (UI only, not in session prefix)
+		t.emitNotice(mission.FormatMission())
+		// Return compact summary for model (preserves prefix cache)
+		return mission.Summary(), nil
 
 	default:
 		return "", fmt.Errorf("unknown action %q; valid: create, add, start, start_task, complete, fail, block, ready, status", p.Action)
 	}
+}
+
+// emitNotice sends a notice event to the sink for UI display. This keeps
+// detailed state out of the session prefix, preserving DeepSeek's cache.
+func (t *MissionTool) emitNotice(text string) {
+	if t.sink != nil {
+		t.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: text})
+	}
+}
+
+// readyTaskIDs returns a comma-separated list of task IDs.
+func readyTaskIDs(tasks []MissionTask) string {
+	ids := make([]string, len(tasks))
+	for i, t := range tasks {
+		ids[i] = t.ID
+	}
+	return strings.Join(ids, ", ")
 }

@@ -633,7 +633,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		if root != "" {
 			sharedDir := filepath.Join(root, "_shared")
 			missionPath := filepath.Join(sharedDir, "MISSION.toml")
-			reg.Add(agent.NewMissionTool(agent.NewMissionManager(missionPath)))
+			reg.Add(agent.NewMissionTool(agent.NewMissionManager(missionPath), sink))
 		}
 
 		return "enabled task."
