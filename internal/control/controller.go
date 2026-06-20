@@ -129,6 +129,9 @@ type Controller struct {
 	// the blocking wait, so it must never be taken by the Approve/Answer paths.
 	promptMu sync.Mutex
 
+	// progress is the optional progress file for long-running task tracking.
+	progress *agent.ProgressFile
+
 	// mu guards the run state and approval bookkeeping; every critical section
 	// under it is short and non-blocking.
 	mu               sync.Mutex
@@ -331,6 +334,9 @@ type Options struct {
 	// PlanModeAllowedTools names tools exempt from the plan-mode read-only gate.
 	// Passed through to the executor agent so user-configured exceptions work.
 	PlanModeAllowedTools []string
+	// Progress is the optional progress file for long-running task tracking.
+	// When set, /progress reads and displays the current state.
+	Progress *agent.ProgressFile
 }
 
 // New builds a Controller. A nil Sink is replaced with event.Discard.
@@ -385,6 +391,7 @@ func New(opts Options) *Controller {
 		granted:                map[string]bool{},
 		clarifyProv:            opts.ClarifyProvider,
 		clarifyCfg:             opts.ClarifyConfig,
+		progress:               opts.Progress,
 	}
 	// Checkpoints: bind a store to the session and route writer pre-edits into it.
 	c.rebindCheckpoints(opts.SessionPath)
@@ -1121,6 +1128,9 @@ func (c *Controller) submitCommandOrTurn(trimmed, input, display string, scopedR
 		case "/tree":
 			c.notice(c.BranchTreeText())
 			return
+		case "/progress":
+			c.showProgress()
+			return
 		case "/branch":
 			args := strings.TrimSpace(strings.TrimPrefix(trimmed, fields[0]))
 			if turn, name, fromTurn, err := ParseBranchTarget(args); err != nil {
@@ -1290,6 +1300,20 @@ func ShortGoalForNotice(goal string) string {
 		return goal
 	}
 	return string(runes[:max]) + "..."
+}
+
+// showProgress displays the current progress file state as a notice.
+func (c *Controller) showProgress() {
+	if c.progress == nil {
+		c.notice("No progress file configured. Use WithProgress() on the task tool to enable progress tracking.")
+		return
+	}
+	content := c.progress.ReadAsString()
+	if content == "" {
+		c.notice("No progress recorded yet. Progress is automatically written when sub-agents complete.")
+		return
+	}
+	c.notice(content)
 }
 
 // applyPlanExec reads the current canonical todo list and starts a goal that

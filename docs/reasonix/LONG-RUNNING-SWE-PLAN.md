@@ -30,7 +30,7 @@ Enable Reasonix to handle SWE tasks spanning days to weeks, using existing primi
 | 1.1 | Define progress file format (`PROGRESS.md`) | ✅ | `internal/agent/progress.go` |
 | 1.2 | Add `ProgressWriter` to subagent_store — auto-write on subagent completion | ✅ | `internal/agent/task.go` |
 | 1.3 | Add progress file injection into subagent system prompt on resume | ✅ | `internal/agent/task.go` (`ProgressContext()`) |
-| 1.4 | Add `/progress` slash command to view current state | ⬜ | — |
+| 1.4 | Add `/progress` slash command to view current state | ✅ | `internal/control/controller.go`, `internal/control/slash.go` |
 | 1.5 | Write tests for progress file round-trip | ✅ | `internal/agent/progress_test.go` |
 
 ### Progress File Format
