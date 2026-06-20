@@ -26,7 +26,7 @@ func (*MissionTool) Description() string {
 	return "Manage long-running missions with structured tasks, dependencies, and verifiable done-conditions. " +
 		"Use 'create' to start a new mission, 'add' to add tasks, 'start' to begin execution, " +
 		"'complete'/'fail'/'block' to update task status, 'ready' to see which tasks can run next, " +
-		"and 'status' to view the full mission state."
+		"'dispatch' to get ready tasks formatted for parallel_tasks, and 'status' to view the full mission state."
 }
 
 func (*MissionTool) Schema() json.RawMessage {
@@ -35,7 +35,7 @@ func (*MissionTool) Schema() json.RawMessage {
 		"properties": {
 			"action": {
 				"type": "string",
-				"enum": ["create", "add", "start", "start_task", "complete", "fail", "block", "ready", "status"],
+				"enum": ["create", "add", "start", "start_task", "complete", "fail", "block", "ready", "dispatch", "status"],
 				"description": "Mission action to perform"
 			},
 			"name": {"type": "string", "description": "Mission name (for create)"},
@@ -168,6 +168,28 @@ func (t *MissionTool) Execute(_ context.Context, raw json.RawMessage) (string, e
 			}
 		}
 		return b.String(), nil
+
+	case "dispatch":
+		ready, err := t.manager.ReadyTasks()
+		if err != nil {
+			return "", fmt.Errorf("get ready tasks: %w", err)
+		}
+		if len(ready) == 0 {
+			return "No tasks ready to dispatch.", nil
+		}
+		var tasks []map[string]interface{}
+		for _, task := range ready {
+			prompt := task.Title
+			if task.DoneWhen != "" {
+				prompt += "\n\nDone when: " + task.DoneWhen
+			}
+			tasks = append(tasks, map[string]interface{}{
+				"prompt":      prompt,
+				"description": task.ID + ": " + task.Title,
+			})
+		}
+		dispatchJSON, _ := json.Marshal(map[string]interface{}{"tasks": tasks})
+		return fmt.Sprintf("Ready to dispatch %d task(s) via parallel_tasks:\n\nArguments for parallel_tasks tool:\n%s", len(tasks), string(dispatchJSON)), nil
 
 	case "status":
 		mission, err := t.manager.Load()

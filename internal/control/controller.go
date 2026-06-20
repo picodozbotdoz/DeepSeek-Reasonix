@@ -132,6 +132,9 @@ type Controller struct {
 	// progress is the optional progress file for long-running task tracking.
 	progress *agent.ProgressFile
 
+	// mission is the optional mission manager for long-running task orchestration.
+	mission *agent.MissionManager
+
 	// mu guards the run state and approval bookkeeping; every critical section
 	// under it is short and non-blocking.
 	mu               sync.Mutex
@@ -337,6 +340,9 @@ type Options struct {
 	// Progress is the optional progress file for long-running task tracking.
 	// When set, /progress reads and displays the current state.
 	Progress *agent.ProgressFile
+	// Mission is the optional mission manager for long-running task orchestration.
+	// When set, /mission reads and displays the current mission state.
+	Mission *agent.MissionManager
 }
 
 // New builds a Controller. A nil Sink is replaced with event.Discard.
@@ -392,6 +398,7 @@ func New(opts Options) *Controller {
 		clarifyProv:            opts.ClarifyProvider,
 		clarifyCfg:             opts.ClarifyConfig,
 		progress:               opts.Progress,
+		mission:                opts.Mission,
 	}
 	// Checkpoints: bind a store to the session and route writer pre-edits into it.
 	c.rebindCheckpoints(opts.SessionPath)
@@ -1131,6 +1138,9 @@ func (c *Controller) submitCommandOrTurn(trimmed, input, display string, scopedR
 		case "/progress":
 			c.showProgress()
 			return
+		case "/mission":
+			c.showMission()
+			return
 		case "/branch":
 			args := strings.TrimSpace(strings.TrimPrefix(trimmed, fields[0]))
 			if turn, name, fromTurn, err := ParseBranchTarget(args); err != nil {
@@ -1314,6 +1324,24 @@ func (c *Controller) showProgress() {
 		return
 	}
 	c.notice(content)
+}
+
+// showMission displays the current mission state as a notice.
+func (c *Controller) showMission() {
+	if c.mission == nil {
+		c.notice("No mission configured. Use the mission tool to create a new mission.")
+		return
+	}
+	mission, err := c.mission.Load()
+	if err != nil {
+		c.notice("Error loading mission: " + err.Error())
+		return
+	}
+	if mission.Name == "" {
+		c.notice("No mission configured. Use the mission tool to create a new mission.")
+		return
+	}
+	c.notice(mission.FormatMission())
 }
 
 // applyPlanExec reads the current canonical todo list and starts a goal that
