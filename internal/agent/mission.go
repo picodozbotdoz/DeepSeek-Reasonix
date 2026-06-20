@@ -45,6 +45,7 @@ type MissionTask struct {
 	BlockedBy   string     `json:"blocked_by,omitempty" yaml:"blocked_by,omitempty"`
 	Commit      string     `json:"committed,omitempty" yaml:"committed,omitempty"`
 	Error       string     `json:"error,omitempty" yaml:"error,omitempty"`
+	Attempts    int        `json:"attempts" yaml:"attempts"`
 	CreatedAt   time.Time  `json:"created_at" yaml:"created_at"`
 	StartedAt   *time.Time `json:"started_at,omitempty" yaml:"started_at,omitempty"`
 	CompletedAt *time.Time `json:"completed_at,omitempty" yaml:"completed_at,omitempty"`

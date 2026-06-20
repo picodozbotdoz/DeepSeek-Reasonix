@@ -203,14 +203,14 @@ budget:
 
 | # | Task | Status | Files |
 |---|------|--------|-------|
-| 5.1 | Design durable execution architecture | ⬜ | — |
-| 5.2 | Implement `Cycle` abstraction — one unit of work (task + verify + commit) | ⬜ | `internal/agent/cycle.go` |
-| 5.3 | Implement `CycleRunner` — execute cycle, persist state, handle crash | ⬜ | `internal/agent/cycle_runner.go` |
-| 5.4 | Implement checkpoint system — state persisted at cycle boundaries | ⬜ | — |
-| 5.5 | Implement recovery — resume from last checkpoint on startup | ⬜ | — |
-| 5.6 | Implement mission orchestrator — read mission, dispatch cycles | ⬜ | `internal/agent/mission_orchestrator.go` |
+| 5.1 | Design durable execution architecture | ✅ | — |
+| 5.2 | Implement `Cycle` abstraction — one unit of work | ✅ | `internal/agent/cycle.go` |
+| 5.3 | Implement `CycleRunner` — execute cycle, persist state, handle crash | ✅ | `internal/agent/cycle_runner.go` |
+| 5.4 | Implement checkpoint system — state persisted at cycle boundaries | ✅ | `internal/agent/checkpoint.go` |
+| 5.5 | Implement recovery — resume from last checkpoint on startup | ✅ | `CheckpointStore.Incomplete()` |
+| 5.6 | Implement mission orchestrator — read mission, dispatch cycles | ✅ | `internal/agent/mission_orchestrator.go` |
 | 5.7 | Add systemd/supervisor integration for auto-restart | ⬜ | — |
-| 5.8 | Write crash-recovery tests | ⬜ | — |
+| 5.8 | Write crash-recovery tests | ✅ | `internal/agent/cycle_test.go` |
 
 ### Design Details
 
