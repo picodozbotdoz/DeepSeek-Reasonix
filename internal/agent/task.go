@@ -8,6 +8,7 @@ import (
 	"io"
 	"runtime/debug"
 	"strings"
+	"time"
 
 	"reasonix/internal/event"
 	"reasonix/internal/jobs"
@@ -132,6 +133,7 @@ type TaskTool struct {
 	baseModel         string
 	baseEffort        string
 	identityProfile   func(modelRef, effort string) (string, string)
+	progress          *ProgressFile
 }
 
 // NewTaskTool wires a task tool to the parent agent's environment so its
@@ -180,6 +182,14 @@ func (t *TaskTool) WithTranscripts(store *SubagentStore, workspaceRoot, baseMode
 
 func (t *TaskTool) WithTranscriptIdentityResolver(resolve func(modelRef, effort string) (string, string)) *TaskTool {
 	t.identityProfile = resolve
+	return t
+}
+
+// WithProgress enables progress file tracking for this task tool. When set,
+// completed sub-agents write entries to the progress file and new sub-agents
+// receive the progress context in their prompt.
+func (t *TaskTool) WithProgress(pf *ProgressFile) *TaskTool {
+	t.progress = pf
 	return t
 }
 
@@ -326,6 +336,7 @@ func (t *TaskTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 			if err := t.transcripts.SaveCompleted(run); err != nil {
 				return FormatSubagentResult("", run.Ref, true), errors.Join(err, t.transcripts.SaveFailed(run))
 			}
+			t.writeProgressEntry(p.Description, p.Prompt, answer, "done")
 			return FormatSubagentResult(answer, run.Ref, false), nil
 		})
 		if run != nil && run.Ref != "" {
@@ -344,6 +355,7 @@ func (t *TaskTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 		if err := t.transcripts.SaveCompleted(run); err != nil {
 			return "", errors.Join(err, t.transcripts.SaveFailed(run))
 		}
+		t.writeProgressEntry(p.Description, p.Prompt, answer, "done")
 		return FormatSubagentResult(answer, run.Ref, false), nil
 	}
 	return answer, nil
@@ -610,4 +622,45 @@ func subSinkFor(parentID string, parent event.Sink) event.Sink {
 			parent.Emit(e)
 		}
 	})
+}
+
+// writeProgressEntry appends a completion entry to the progress file. It is
+// best-effort — errors are logged but never block the sub-agent result.
+func (t *TaskTool) writeProgressEntry(description, prompt, answer, status string) {
+	if t.progress == nil {
+		return
+	}
+	state, _ := t.progress.Read()
+	task := description
+	if task == "" {
+		// Use first 80 chars of prompt as task description
+		task = strings.TrimSpace(prompt)
+		if len(task) > 80 {
+			task = task[:80] + "..."
+		}
+	}
+	entry := ProgressEntry{
+		Status:    status,
+		Task:      task,
+		UpdatedAt: time.Now().UTC(),
+	}
+	switch status {
+	case "done":
+		state.Completed = append(state.Completed, entry)
+	case "in_progress":
+		state.InProgress = append(state.InProgress, entry)
+	case "blocked":
+		state.Blocked = append(state.Blocked, entry)
+	}
+	_ = t.progress.Write(state)
+}
+
+// ProgressContext returns the progress file content for injection into a
+// sub-agent's prompt. Returns empty string if no progress file is configured
+// or the file doesn't exist.
+func (t *TaskTool) ProgressContext() string {
+	if t.progress == nil {
+		return ""
+	}
+	return t.progress.ReadAsString()
 }
