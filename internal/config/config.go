@@ -1045,6 +1045,15 @@ type AgentConfig struct {
 	// the "plan mode is read-only" block. Use sparingly — prefer the built-in safe
 	// bash commands for read-only exploration.
 	PlanModeAllowedTools []string `toml:"plan_mode_allowed_tools"`
+	// MaxTokensPerTask limits total tokens consumed by a single sub-agent task.
+	// 0 = unlimited. Checked before each LLM call within the task.
+	MaxTokensPerTask int `toml:"max_tokens_per_task"`
+	// MaxCostPerMission limits total USD cost for an entire mission.
+	// 0 = unlimited. Checked before each LLM call.
+	MaxCostPerMission float64 `toml:"max_cost_per_mission"`
+	// MaxTurnsPerTask limits the number of LLM turns in a single sub-agent task.
+	// 0 = unlimited.
+	MaxTurnsPerTask int `toml:"max_turns_per_task"`
 }
 
 // ProviderEntry declares a model provider instance. ContextWindow is the model's

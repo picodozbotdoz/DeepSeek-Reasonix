@@ -256,6 +256,10 @@ type Agent struct {
 	// plan-mode check. nil disables gating entirely.
 	gate Gate
 
+	// budget, when non-nil, tracks token/cost usage and enforces limits.
+	// Budget exhaustion stops the agent loop after the current step completes.
+	budget *BudgetTracker
+
 	// hooks, when non-nil, fires PreToolUse / PostToolUse shell hooks around each
 	// tool call. nil disables hook firing.
 	hooks ToolHooks
@@ -593,6 +597,11 @@ type Options struct {
 	// returns false. Use sparingly; the caller is responsible for ensuring the
 	// tool invocation is safe in a read-only context (e.g. bash for git status).
 	PlanModeAllowedTools []string
+
+	// Budget optionally tracks resource usage and enforces limits. nil disables
+	// budget enforcement. When the budget is exceeded, the agent loop stops after
+	// the current step completes.
+	Budget *BudgetTracker
 }
 
 func stringSet(ss []string) map[string]bool {
@@ -661,6 +670,7 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 		archiveDir:           opts.ArchiveDir,
 		keepPolicy:           opts.KeepPolicy,
 		planModeAllowedTools: stringSet(opts.PlanModeAllowedTools),
+		budget:               opts.Budget,
 	}
 	a.SetReasoningLanguage(opts.ReasoningLanguage)
 	return a
@@ -700,6 +710,15 @@ func (a *Agent) Run(ctx context.Context, input string) error {
 	streamRecoveries := 0
 	executorHandoff := a.executorHandoffGuard && strings.Contains(input, executorHandoffMarker)
 	for step := 0; a.maxSteps <= 0 || step < a.maxSteps; step++ {
+		// Budget check: stop if limits are exceeded.
+		if a.budget != nil {
+			if status := a.budget.Check(); status.Exceeded() {
+				a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn,
+					Text: "Budget exceeded: " + status.Summary() + " — stopping agent loop."})
+				return nil
+			}
+			a.budget.RecordTurn()
+		}
 		// Consume a queued steer and persist it to the session so it
 		// survives tab switches and history replay. The model sees it as
 		// guidance (with a prefix), not a new task. One cache miss per

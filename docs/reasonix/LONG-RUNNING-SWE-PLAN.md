@@ -153,12 +153,12 @@ budget:
 
 | # | Task | Status | Files |
 |---|------|--------|-------|
-| 3.1 | Add `BudgetTracker` — incremental cost tracking with limits | ⬜ | `internal/agent/budget.go` |
-| 3.2 | Add budget check before each LLM call | ⬜ | `internal/agent/agent.go` |
-| 3.3 | Add `[agent]` config fields: `max_tokens_per_task`, `max_cost_per_mission` | ⬜ | `internal/config/config.go` |
-| 3.4 | Add budget exhaustion handling — pause, notify, or abort | ⬜ | — |
+| 3.1 | Add `BudgetTracker` — incremental cost tracking with limits | ✅ | `internal/agent/budget.go` |
+| 3.2 | Add budget check before each LLM call | ✅ | `internal/agent/agent.go` |
+| 3.3 | Add `[agent]` config fields: `max_tokens_per_task`, `max_cost_per_mission` | ✅ | `internal/config/config.go` |
+| 3.4 | Add budget exhaustion handling — pause, notify, or abort | ✅ | `internal/agent/agent.go` (notice + stop loop) |
 | 3.5 | Add budget dashboard to mission status | ⬜ | — |
-| 3.6 | Write tests | ⬜ | — |
+| 3.6 | Write tests | ✅ | `internal/agent/budget_test.go` |
 
 ---
 
