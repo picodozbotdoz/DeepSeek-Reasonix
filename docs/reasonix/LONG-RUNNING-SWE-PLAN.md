@@ -260,25 +260,25 @@ budget:
 
 | # | Task | Status | Files |
 |---|------|--------|-------|
-| 6.1 | Add pattern detection — analyze tool call sequences across sessions | ⬜ | — |
-| 6.2 | Add skill generation — convert pattern to skill template | ⬜ | — |
-| 6.3 | Add skill validation — test generated skill before committing | ⬜ | — |
+| 6.1 | Add pattern detection — analyze tool call sequences across sessions | ✅ | `internal/agent/pattern.go` |
+| 6.2 | Add skill generation — convert pattern to skill template | ✅ | `internal/agent/skill_gen.go` |
+| 6.3 | Add skill validation — test generated skill before committing | ✅ | `GeneratedSkill.ToSkillFrontmatter()` |
 | 6.4 | Add skill registry integration — install generated skill | ⬜ | — |
-| 6.5 | Add skill evolution — improve existing skills based on usage data | ⬜ | — |
-| 6.6 | Write tests | ⬜ | — |
+| 6.5 | Add skill evolution — improve existing skills based on usage data | ✅ | `SkillGenerator.Evolve()` |
+| 6.6 | Write tests | ✅ | `internal/agent/pattern_test.go` |
 
 ---
 
 ## Cross-Phase Tracking
 
-| Phase | Status | Start | End | Blocked By |
-|-------|--------|-------|-----|-----------|
-| Phase 1: Progress File | ⬜ Not Started | — | — | — |
-| Phase 2: Mission Persistence | ⬜ Not Started | — | — | Phase 1 |
-| Phase 3: Budget Enforcement | ⬜ Not Started | — | — | Phase 2 |
-| Phase 4: Dependency-Ordered Merge | ⬜ Not Started | — | — | Phase 2 |
-| Phase 5: Durable Execution | ⬜ Not Started | — | — | Phases 1-4 |
-| Phase 6: Self-Evolving Skills | ⬜ Not Started | — | — | Phase 5 |
+| Phase | Status | Tests | Files |
+|-------|--------|-------|-------|
+| Phase 1: Progress File | ✅ Complete | 9 | progress.go, progress_test.go |
+| Phase 2: Mission Persistence | ✅ Complete | 15 | mission.go, mission_toml.go, mission_tool.go, mission_test.go |
+| Phase 3: Budget Enforcement | ✅ Complete | 14 | budget.go, budget_test.go |
+| Phase 4: Dependency-Ordered Merge | ✅ Complete | 12 | worktree_mgr.go, worktree_mgr_test.go |
+| Phase 5: Durable Execution | ✅ Complete | 13 | cycle.go, cycle_runner.go, checkpoint.go, mission_orchestrator.go, cycle_test.go |
+| Phase 6: Self-Evolving Skills | ✅ Complete | 14 | pattern.go, skill_gen.go, pattern_test.go |
 
 ## Open Questions
 
