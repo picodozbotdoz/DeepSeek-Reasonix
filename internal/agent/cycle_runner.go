@@ -9,23 +9,25 @@ import (
 
 	"reasonix/internal/event"
 	"reasonix/internal/provider"
+	"reasonix/internal/tool"
 )
 
 // CycleRunner executes a single cycle: run model → verify → commit → checkpoint.
 // It is designed to be called from the MissionOrchestrator or directly.
 type CycleRunner struct {
-	prov      provider.Provider
-	tools     interface{ Schemas() string }
-	session   *Session
-	sink      event.Sink
+	prov       provider.Provider
+	tools      *tool.Registry
+	session    *Session
+	sink       event.Sink
 	checkpoint *CheckpointStore
-	config    CycleConfig
+	config     CycleConfig
 }
 
 // NewCycleRunner creates a runner that executes cycles within the given context.
-func NewCycleRunner(prov provider.Provider, sess *Session, sink event.Sink, cpStore *CheckpointStore, cfg CycleConfig) *CycleRunner {
+func NewCycleRunner(prov provider.Provider, tools *tool.Registry, sess *Session, sink event.Sink, cpStore *CheckpointStore, cfg CycleConfig) *CycleRunner {
 	return &CycleRunner{
 		prov:       prov,
+		tools:      tools,
 		session:    sess,
 		sink:       sink,
 		checkpoint: cpStore,
@@ -80,8 +82,8 @@ func (cr *CycleRunner) RunCycle(ctx context.Context, cycle *Cycle, prompt string
 // of turns to prevent runaway execution.
 func (cr *CycleRunner) runAgent(ctx context.Context, cycle *Cycle, prompt string) error {
 	// Create a fresh agent for this cycle's work
-	agent := New(cr.prov, nil, cr.session, Options{
-		MaxSteps:  cr.config.MaxTurns,
+	agent := New(cr.prov, cr.tools, cr.session, Options{
+		MaxSteps:    cr.config.MaxTurns,
 		UsageSource: event.UsageSourceSubagent,
 	}, cr.sink)
 

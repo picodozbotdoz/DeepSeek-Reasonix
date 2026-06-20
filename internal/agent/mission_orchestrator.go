@@ -9,6 +9,7 @@ import (
 
 	"reasonix/internal/event"
 	"reasonix/internal/provider"
+	"reasonix/internal/tool"
 )
 
 // OrchestratorConfig configures the mission orchestrator.
@@ -26,6 +27,7 @@ type MissionOrchestrator struct {
 	checkpoint  *CheckpointStore
 	runner      *CycleRunner
 	prov        provider.Provider
+	tools       *tool.Registry
 	sess        *Session
 	sink        event.Sink
 	config      OrchestratorConfig
@@ -39,6 +41,7 @@ func NewMissionOrchestrator(
 	worktree *WorktreeManager,
 	cpStore *CheckpointStore,
 	prov provider.Provider,
+	tools *tool.Registry,
 	sess *Session,
 	sink event.Sink,
 	cfg OrchestratorConfig,
@@ -52,6 +55,7 @@ func NewMissionOrchestrator(
 		worktree:   worktree,
 		checkpoint: cpStore,
 		prov:       prov,
+		tools:      tools,
 		sess:       sess,
 		sink:       sink,
 		config:     cfg,
@@ -145,7 +149,7 @@ func (mo *MissionOrchestrator) dispatchTask(ctx context.Context, task *MissionTa
 
 	// Create and run cycle
 	cycle := NewCycle(task.ID, mission.Name)
-	runner := NewCycleRunner(mo.prov, mo.sess, mo.sink, mo.checkpoint, mo.config.CycleConfig)
+	runner := NewCycleRunner(mo.prov, mo.tools, mo.sess, mo.sink, mo.checkpoint, mo.config.CycleConfig)
 	cycle = runner.RunCycle(ctx, cycle, prompt)
 
 	// Update mission based on cycle result
