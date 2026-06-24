@@ -31,6 +31,7 @@ import (
 	"reasonix/internal/agent"
 	"reasonix/internal/billing"
 	"reasonix/internal/checkpoint"
+	"reasonix/internal/clarify"
 	"reasonix/internal/command"
 	"reasonix/internal/config"
 	"reasonix/internal/diff"
@@ -138,19 +139,58 @@ type Controller struct {
 	// See approval.go.
 	approval approvalManager
 
-	// mu guards the run state; every critical section under it is short and
-	// non-blocking.
-	mu          sync.Mutex
-	cancel      context.CancelFunc
-	running     bool
-	canceling   bool
-	autosaveWG  sync.WaitGroup
-	planMode    bool
-	sessionPath string
+	// progress is the optional progress file for long-running task tracking.
+	progress *agent.ProgressFile
+
+	// mission is the optional mission manager for long-running task orchestration.
+	mission *agent.MissionManager
+
+	// mu guards the run state and approval bookkeeping; every critical section
+	// under it is short and non-blocking.
+	mu               sync.Mutex
+	cancel           context.CancelFunc
+	running          bool
+	canceling        bool
+	autosaveWG       sync.WaitGroup
+	planMode         bool
+	goal             string
+	goalStatus       string
+	goalResearchMode GoalResearchMode
+	goalTurns        int
+	goalBlocks       int
+	goalBlock        string
+	// goalInterceptMsg, when non-empty, overrides the generic goalContinueTurn prompt
+	// for the next continuation turn. Used by advanceGoalAfterTurn to inject specific
+	// feedback such as incomplete-todo reminders.
+	goalInterceptMsg string
+	// goalIntercepts counts consecutive incomplete-todo intercepts for the current
+	// goal. After the first intercept, the agent is reminded to update its todo
+	// list if the work is actually done; a second consecutive claim of completion
+	// is treated as an override and let through.
+	goalIntercepts int
+	// goalStrict, when true, disables the override escape hatch: every
+	// [goal:complete] while todos are incomplete is intercepted, and the
+	// agent must actually finish or update all items before it can complete.
+	goalStrict bool
+	// goalSelfCheckDone tracks whether the quality self-check prompt has been
+	// injected for the current goal. On first [goal:complete] with all todos
+	// done, the agent is asked to self-verify before final completion.
+	goalSelfCheckDone bool
+	// goalIdleTurns counts consecutive turns without any tool call. When this
+	// exceeds the threshold an idle reminder is injected via goalInterceptMsg.
+	goalIdleTurns int
+	sessionPath   string
+	approvals     map[string]pendingApproval
+	asks          map[string]pendingAsk
+	granted       map[string]bool
+	nextID        int
 	// turn counts model turns this session, passed to hooks in their payload.
 	turn int
 
 	displayRecorder func(content, display string)
+
+	clarifyProv provider.Provider // optional lightweight provider for prompt refinement
+	clarifyCfg  config.ClarifyConfig
 }
 
 type approvalReply struct {
@@ -263,6 +303,12 @@ type Options struct {
 	// persist to disk (e.g. "Bash(go test:*)"). The callback is wired into the
 	// permission Gate on EnableInteractiveApproval.
 	OnRemember func(rule string) RememberResult
+	// ClarifyProvider is an optional lightweight provider for prompt refinement
+	// (Ctrl+K / /clarify). When nil, refinement falls back to the session's
+	// executor provider.
+	ClarifyProvider provider.Provider
+	// ClarifyConfig holds the [clarify] config section for both refinement modes.
+	ClarifyConfig config.ClarifyConfig
 	// PlanModeAllowedTools names tools exempt from the plan-mode read-only gate.
 	// Passed through to the executor agent so user-configured exceptions work.
 	PlanModeAllowedTools []string
@@ -271,6 +317,15 @@ type Options struct {
 	// terminal. Bot/headless frontends set a positive value so an unanswered
 	// prompt can't wedge the session indefinitely (#4626, #4402).
 	ApprovalTimeout time.Duration
+	// Progress is the optional progress file for long-running task tracking.
+	// When set, /progress reads and displays the current state.
+	Progress *agent.ProgressFile
+	// Mission is the optional mission manager for long-running task orchestration.
+	// When set, /mission reads and displays the current mission state.
+	Mission *agent.MissionManager
+	// Budget is the optional budget tracker for resource usage enforcement.
+	// When set, the agent loop checks limits before each LLM call.
+	Budget *agent.BudgetTracker
 }
 
 // New builds a Controller. A nil Sink is replaced with event.Discard.
@@ -315,6 +370,8 @@ func New(opts Options) *Controller {
 		mcp:                    newMcpManager(opts.Host, opts.Registry, pluginCtx),
 		workspaceRoot:          opts.WorkspaceRoot,
 		approval:               newApprovalManager(opts.Policy, ToolApprovalAsk, opts.ApprovalTimeout),
+		progress:               opts.Progress,
+		mission:                opts.Mission,
 	}
 	// Checkpoints: bind a store to the session and route writer pre-edits into it.
 	c.rebindCheckpoints(opts.SessionPath)
@@ -694,6 +751,12 @@ func (c *Controller) submitCommandOrTurn(trimmed, input, display string, scopedR
 		case "/tree":
 			c.notice(c.BranchTreeText())
 			return
+		case "/progress":
+			c.showProgress()
+			return
+		case "/mission":
+			c.showMission()
+			return
 		case "/branch":
 			args := strings.TrimSpace(strings.TrimPrefix(trimmed, fields[0]))
 			if turn, name, fromTurn, err := ParseBranchTarget(args); err != nil {
@@ -852,6 +915,48 @@ func (c *Controller) applyGoalCommand(input, display string) bool {
 		}
 	}
 	return true
+}
+
+func ShortGoalForNotice(goal string) string {
+	goal = strings.Join(strings.Fields(goal), " ")
+	runes := []rune(goal)
+	const max = 160
+	if len(runes) <= max {
+		return goal
+	}
+	return string(runes[:max]) + "..."
+}
+
+// showProgress displays the current progress file state as a notice.
+func (c *Controller) showProgress() {
+	if c.progress == nil {
+		c.notice("No progress file configured. Use WithProgress() on the task tool to enable progress tracking.")
+		return
+	}
+	content := c.progress.ReadAsString()
+	if content == "" {
+		c.notice("No progress recorded yet. Progress is automatically written when sub-agents complete.")
+		return
+	}
+	c.notice(content)
+}
+
+// showMission displays the current mission state as a notice.
+func (c *Controller) showMission() {
+	if c.mission == nil {
+		c.notice("No mission configured. Use the mission tool to create a new mission.")
+		return
+	}
+	mission, err := c.mission.Load()
+	if err != nil {
+		c.notice("Error loading mission: " + err.Error())
+		return
+	}
+	if mission.Name == "" {
+		c.notice("No mission configured. Use the mission tool to create a new mission.")
+		return
+	}
+	c.notice(mission.FormatMission())
 }
 
 // applyPlanExec reads the current canonical todo list and starts a goal that
@@ -2689,6 +2794,68 @@ func (c *Controller) SaveMemory(m memory.Memory) (string, error) {
 // the manual counterpart to the model's `forget` tool.
 func (c *Controller) ForgetMemory(name string) error {
 	return c.memory.forget(name)
+}
+
+// ClarifyPrompt refines the user's input text via a fresh, prefix-stable LLM
+// call (mode 2). Uses ClarifyConfig.Fresh settings for system prompt,
+// instruction, history depth, and tool names.
+func (c *Controller) ClarifyPrompt(ctx context.Context, input string) ([]string, *provider.Usage, error) {
+	if strings.TrimSpace(input) == "" {
+		return nil, nil, fmt.Errorf("nothing to clarify")
+	}
+	if c.clarifyProv == nil {
+		return []string{input}, nil, nil
+	}
+
+	sysPrompt := c.clarifyCfg.Fresh.SystemPrompt
+	instruction := c.clarifyCfg.Fresh.Instruction
+	maxPairs := c.clarifyCfg.Fresh.MaxHistoryPairs
+	toolNames := c.clarifyToolNames(c.clarifyCfg.Fresh.ToolNames)
+	maxVersions := c.clarifyCfg.Fresh.EffectiveVersions()
+	maxTokens := c.clarifyCfg.Fresh.EffectiveTokens()
+
+	// Collect conversation history from the session if maxPairs > 0.
+	var history []provider.Message
+	if maxPairs > 0 && c.executor != nil {
+		history = c.executor.Session().Snapshot()
+	}
+
+	return clarify.RefineFresh(ctx, c.clarifyProv, input, history, "", sysPrompt, instruction, maxPairs, toolNames, maxVersions, maxTokens)
+}
+
+// ClarifyPromptContext refines the user's input text by sending full session
+// context (mode 1). Uses ClarifyConfig.Context settings.
+func (c *Controller) ClarifyPromptContext(ctx context.Context, input string) ([]string, *provider.Usage, error) {
+	if strings.TrimSpace(input) == "" {
+		return nil, nil, fmt.Errorf("nothing to clarify")
+	}
+	if c.clarifyProv == nil {
+		return []string{input}, nil, nil
+	}
+
+	sysPrompt := c.clarifyCfg.Context.SystemPrompt
+	instruction := c.clarifyCfg.Context.Instruction
+	toolNames := c.clarifyToolNames(c.clarifyCfg.Context.ToolNames)
+	maxVersions := c.clarifyCfg.Context.EffectiveVersions()
+	maxTokens := c.clarifyCfg.Context.EffectiveTokens()
+
+	// Collect the full session history for context-aware refinement.
+	var sessionMsgs []provider.Message
+	if c.executor != nil {
+		sessionMsgs = c.executor.Session().Snapshot()
+	}
+
+	return clarify.RefineContextual(ctx, c.clarifyProv, input, sessionMsgs, "", sysPrompt, instruction, toolNames, maxVersions, maxTokens)
+}
+
+// clarifyToolNames returns the list of registered tool names when enabled is
+// true, or nil when disabled. The names are sorted and consistent per session,
+// so they form part of the cache-stable prefix in mode 2.
+func (c *Controller) clarifyToolNames(enabled bool) []string {
+	if !enabled || c.reg == nil {
+		return nil
+	}
+	return c.reg.Names()
 }
 
 // QueueMemory implements memory.Queue: when the model runs the remember/forget

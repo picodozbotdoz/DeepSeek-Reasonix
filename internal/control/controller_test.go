@@ -2031,3 +2031,132 @@ func cmdNames(cmds []command.Command) []string {
 	}
 	return names
 }
+
+// mockClarifyProvider streams a VERSION: response for testing.
+type mockClarifyProvider struct {
+	text string
+	err  error
+}
+
+func (m *mockClarifyProvider) Name() string { return "clarify-test" }
+
+func (m *mockClarifyProvider) Stream(_ context.Context, _ provider.Request) (<-chan provider.Chunk, error) {
+	ch := make(chan provider.Chunk, 10)
+	go func() {
+		defer close(ch)
+		if m.err != nil {
+			ch <- provider.Chunk{Type: provider.ChunkError, Err: m.err}
+			return
+		}
+		ch <- provider.Chunk{Type: provider.ChunkText, Text: m.text}
+		ch <- provider.Chunk{Type: provider.ChunkUsage, Usage: &provider.Usage{}}
+		ch <- provider.Chunk{Type: provider.ChunkDone}
+	}()
+	return ch, nil
+}
+
+func TestClarifyPromptWithProvider(t *testing.T) {
+	prov := &mockClarifyProvider{
+		text: "VERSION: First refined version\nVERSION: Second refined version",
+	}
+	sess := agent.NewSession("sys")
+	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
+	c := New(Options{
+		Runner:          appendingRunner{session: sess},
+		Executor:        exec,
+		ClarifyProvider: prov,
+	})
+
+	results, _, err := c.ClarifyPrompt(context.Background(), "my original prompt")
+	if err != nil {
+		t.Fatalf("ClarifyPrompt() error: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected 3 results (original + 2 refinements), got %d: %v", len(results), results)
+	}
+	if results[0] != "my original prompt" {
+		t.Errorf("results[0] = %q, want %q", results[0], "my original prompt")
+	}
+}
+
+func TestClarifyPromptPassthroughWhenNoProvider(t *testing.T) {
+	sess := agent.NewSession("sys")
+	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
+	c := New(Options{
+		Runner:   appendingRunner{session: sess},
+		Executor: exec,
+	})
+
+	results, _, err := c.ClarifyPrompt(context.Background(), "some prompt")
+	if err != nil {
+		t.Fatalf("ClarifyPrompt() error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result (passthrough), got %d: %v", len(results), results)
+	}
+	if results[0] != "some prompt" {
+		t.Errorf("results[0] = %q, want %q", results[0], "some prompt")
+	}
+}
+
+func TestClarifyPromptContextWithProvider(t *testing.T) {
+	prov := &mockClarifyProvider{
+		text: "VERSION: Context aware refinement",
+	}
+	sess := agent.NewSession("sys")
+	sess.Add(provider.Message{Role: provider.RoleUser, Content: "can you help me debug"})
+	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: "sure, what's the issue"})
+	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
+	c := New(Options{
+		Runner:          appendingRunner{session: sess},
+		Executor:        exec,
+		ClarifyProvider: prov,
+	})
+
+	results, _, err := c.ClarifyPromptContext(context.Background(), "fix the bug")
+	if err != nil {
+		t.Fatalf("ClarifyPromptContext() error: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d: %v", len(results), results)
+	}
+	if results[0] != "fix the bug" {
+		t.Errorf("results[0] = %q, want %q", results[0], "fix the bug")
+	}
+}
+
+func TestClarifyPromptContextPassthroughWhenNoProvider(t *testing.T) {
+	sess := agent.NewSession("sys")
+	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
+	c := New(Options{
+		Runner:   appendingRunner{session: sess},
+		Executor: exec,
+	})
+
+	results, _, err := c.ClarifyPromptContext(context.Background(), "some prompt")
+	if err != nil {
+		t.Fatalf("ClarifyPromptContext() error: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result (passthrough), got %d: %v", len(results), results)
+	}
+	if results[0] != "some prompt" {
+		t.Errorf("results[0] = %q, want %q", results[0], "some prompt")
+	}
+}
+
+func TestClarifyPromptContextEmptyInput(t *testing.T) {
+	c := New(Options{})
+	_, _, err := c.ClarifyPromptContext(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected error for empty input")
+	}
+}
+
+func TestClarifyPromptEmptyInput(t *testing.T) {
+	c := New(Options{})
+	_, _, err := c.ClarifyPrompt(context.Background(), "")
+	if err == nil {
+		t.Fatal("expected error for empty input")
+	}
+}

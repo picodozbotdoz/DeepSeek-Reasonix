@@ -34,7 +34,6 @@ func TestACPBuiltinToolsKeepSessionLevelBuiltins(t *testing.T) {
 		"bash_output",
 		"kill_shell",
 		"wait",
-		"move_file",
 		"notebook_edit",
 	} {
 		if tools[name] == nil {
@@ -77,6 +76,9 @@ func TestACPFactoryLoadsSessionCwdProjectConfig(t *testing.T) {
 	project := t.TempDir()
 	if err := os.WriteFile(filepath.Join(project, "reasonix.toml"), []byte(`
 default_model = "local"
+
+[codegraph]
+enabled = false
 
 [[providers]]
 name = "local"
@@ -250,15 +252,6 @@ func TestACPSubagentProviderResolverRejectsInvalidEffort(t *testing.T) {
 	if _, _, _, err := resolve("", "max"); err == nil {
 		t.Fatal("invalid effort should fail before ACP task falls back to the parent profile")
 	}
-}
-
-func findACPConfigOption(options []acp.SessionConfigOption, id string) (acp.SessionConfigOption, bool) {
-	for _, opt := range options {
-		if opt.ID == id {
-			return opt, true
-		}
-	}
-	return acp.SessionConfigOption{}, false
 }
 
 func toolMap(tools []tool.Tool) map[string]tool.Tool {

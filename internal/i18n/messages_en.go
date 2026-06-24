@@ -395,4 +395,17 @@ Configuration:
   Secrets come from the environment via api_key_env (e.g. DEEPSEEK_API_KEY).
   Run 'reasonix setup' to scaffold a config; see docs/SPEC.md.
 `,
+
+	ClarifyTitle:         "Prompt Refinement",
+	ClarifyHint:          "↑/↓ navigate · Enter select · Ctrl+V expand · Esc keep original",
+	ClarifyOriginalLabel: "Original",
+	ClarifyRefinedFmt:    "Refined %d",
+	ClarifyEmpty:         "nothing to clarify — type a prompt first",
+	ClarifyFailedFmt:     "clarify failed: %s",
+	ClarifyCancelled:     "using original prompt",
+	ClarifyUsage:         "usage: /clarify [--context] <text>  or  type a prompt and press Ctrl+K (Alt+K for context)",
+	ClarifyWorking:       "refining prompt…",
+	ClarifySelected:      "refined prompt selected — press Enter to submit",
+	ClarifyRunRefinedFmt: "◇ prompt refined\n  before: %s\n  after:  %s",
+	ClarifyRunFailedFmt:  "clarify: %s (using original prompt)",
 }

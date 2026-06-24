@@ -789,7 +789,11 @@ func (c *Config) SaveTo(path string) error {
 	if scope == RenderScopeProject {
 		return c.saveProjectIncremental(path)
 	}
-	return c.SaveToScope(path, scope)
+	err := c.SaveToScope(path, scope)
+	if err == nil {
+		invalidateConfigCache()
+	}
+	return err
 }
 
 func (c *Config) SaveToScope(path string, scope RenderScope) error {

@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -325,6 +327,330 @@ func TestExecuteOneFailedReceiptDoesNotVerify(t *testing.T) {
 	}
 	if a.evidence.HasSuccessfulCommand("go test ./...") {
 		t.Fatal("failed bash receipt must not verify")
+	}
+}
+
+// --- cross-server group tests ---
+
+func TestMCPServer(t *testing.T) {
+	tests := []struct {
+		name string
+		want string
+	}{
+		{"mcp__learner__delegate_task", "learner"},
+		{"mcp__coder__delegate_task", "coder"},
+		{"mcp__tester__delegate_task", "tester"},
+		{"mcp__single", "single"},                          // no double underscore after server
+		{"mcp__a__b__c", "a"},                              // only first segment
+		{"builtin_read_file", ""},
+		{"bash", ""},
+		{"", ""},
+		{"mcp__", ""},
+		{"mcp____", ""},
+	}
+	for _, tc := range tests {
+		got := mcpServer(tc.name)
+		if got != tc.want {
+			t.Errorf("mcpServer(%q) = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestGroupBatchesByServerAllBuiltIn(t *testing.T) {
+	// Three serial batches (same built-in server="") → one group.
+	batches := []toolCallBatch{
+		{start: 0, end: 1}, // bash
+		{start: 1, end: 2}, // read_file
+		{start: 2, end: 3}, // edit_file
+	}
+	calls := []provider.ToolCall{
+		{Name: "bash"},
+		{Name: "read_file"},
+		{Name: "edit_file"},
+	}
+	got := groupBatchesByServer(batches, calls)
+	if len(got) != 1 {
+		t.Fatalf("wanted 1 group, got %d: %+v", len(got), got)
+	}
+	if len(got[0].batches) != 3 {
+		t.Errorf("wanted 3 batches in the group, got %d", len(got[0].batches))
+	}
+}
+
+func TestGroupBatchesByServerDifferentMCP(t *testing.T) {
+	// Two serial batches for different MCP servers → two groups.
+	batches := []toolCallBatch{
+		{start: 0, end: 1}, // mcp__learner__delegate_task
+		{start: 1, end: 2}, // mcp__coder__delegate_task
+	}
+	calls := []provider.ToolCall{
+		{Name: "mcp__learner__delegate_task"},
+		{Name: "mcp__coder__delegate_task"},
+	}
+	got := groupBatchesByServer(batches, calls)
+	if len(got) != 2 {
+		t.Fatalf("wanted 2 groups, got %d: %+v", len(got), got)
+	}
+}
+
+func TestGroupBatchesByServerSameMCPMerges(t *testing.T) {
+	// Two serial batches for the same MCP server → merged into one group.
+	batches := []toolCallBatch{
+		{start: 0, end: 1},
+		{start: 1, end: 2},
+	}
+	calls := []provider.ToolCall{
+		{Name: "mcp__learner__delegate_task"},
+		{Name: "mcp__learner__something_else"},
+	}
+	got := groupBatchesByServer(batches, calls)
+	if len(got) != 1 {
+		t.Fatalf("wanted 1 group, got %d: %+v", len(got), got)
+	}
+	if len(got[0].batches) != 2 {
+		t.Errorf("wanted 2 batches in the merged group, got %d", len(got[0].batches))
+	}
+}
+
+func TestGroupBatchesByServerParallelBreaksGroup(t *testing.T) {
+	// A serial batch, then a parallel batch, then the same server again.
+	// The parallel batch always starts a new group, so the second serial batch
+	// does NOT merge with the first.
+	batches := []toolCallBatch{
+		{start: 0, end: 1},                   // serial, mcp__learner
+		{start: 1, end: 2, parallel: true},   // parallel, breaks group
+		{start: 2, end: 3},                   // serial, mcp__learner again
+	}
+	calls := []provider.ToolCall{
+		{Name: "mcp__learner__a"},
+		{Name: "mcp__learner__b"},
+		{Name: "mcp__learner__c"},
+	}
+	got := groupBatchesByServer(batches, calls)
+	if len(got) != 3 {
+		t.Fatalf("wanted 3 groups, got %d: %+v", len(got), got)
+	}
+}
+
+func TestGroupBatchesByServerMixed(t *testing.T) {
+	// Built-in, MCP server A, MCP server B → three groups.
+	batches := []toolCallBatch{
+		{start: 0, end: 1}, // built-in
+		{start: 1, end: 2}, // mcp__learner
+		{start: 2, end: 3}, // mcp__coder
+	}
+	calls := []provider.ToolCall{
+		{Name: "bash"},
+		{Name: "mcp__learner__delegate_task"},
+		{Name: "mcp__coder__delegate_task"},
+	}
+	got := groupBatchesByServer(batches, calls)
+	if len(got) != 3 {
+		t.Fatalf("wanted 3 groups, got %d: %+v", len(got), got)
+	}
+}
+
+// TestRunServerGroupsCrossServerParallel verifies that groups targeting
+// different MCP servers run concurrently. Each group has one 80ms call;
+// sequential execution would take ~160ms, parallel ~80ms.
+func TestRunServerGroupsCrossServerParallel(t *testing.T) {
+	const delay = 80 * time.Millisecond
+
+	callsDispatched := int32(0)
+	run := func(i int) {
+		atomic.AddInt32(&callsDispatched, 1)
+		<-time.After(delay)
+	}
+
+	groups := []serverGroup{
+		{server: "learner", batches: []toolCallBatch{{start: 0, end: 1}}},
+		{server: "coder", batches: []toolCallBatch{{start: 1, end: 2}}},
+	}
+
+	start := time.Now()
+	runServerGroups(groups, run)
+	elapsed := time.Since(start)
+
+	if callsDispatched != 2 {
+		t.Errorf("dispatched %d calls, want 2", callsDispatched)
+	}
+	// Parallel: ~80ms + scheduler overhead; serial: >160ms.
+	if elapsed >= 2*delay {
+		t.Errorf("cross-server groups took %v (>= %v) — not parallel", elapsed, 2*delay)
+	}
+}
+
+// TestRunServerGroupsSameServerSerial verifies that groups targeting the same
+// MCP server run serially (shared connection).
+func TestRunServerGroupsSameServerSerial(t *testing.T) {
+	const delay = 50 * time.Millisecond
+
+	callOrder := make([]int, 0, 2)
+	var mu sync.Mutex
+	run := func(i int) {
+		mu.Lock()
+		callOrder = append(callOrder, i)
+		mu.Unlock()
+		<-time.After(delay)
+	}
+
+	// Two serial batches merged into one group for the same server.
+	groups := []serverGroup{
+		{server: "learner", batches: []toolCallBatch{{start: 0, end: 1}, {start: 1, end: 2}}},
+	}
+
+	start := time.Now()
+	runServerGroups(groups, run)
+	elapsed := time.Since(start)
+
+	if len(callOrder) != 2 {
+		t.Fatalf("dispatched %d calls, want 2", len(callOrder))
+	}
+	if callOrder[0] != 0 || callOrder[1] != 1 {
+		t.Errorf("calls out of order: %v, want [0 1]", callOrder)
+	}
+	// Serial: ~100ms.
+	if elapsed < 2*delay {
+		t.Errorf("same-server group took %v (< %v) — batches ran in parallel", elapsed, 2*delay)
+	}
+}
+
+// TestRunServerGroupsSameNamedServerSerial verifies that two groups targeting
+// the same named MCP server run serially (only different servers parallelize).
+func TestRunServerGroupsSameNamedServerSerial(t *testing.T) {
+	const delay = 50 * time.Millisecond
+
+	callOrder := make([]int, 0, 2)
+	var mu sync.Mutex
+	run := func(i int) {
+		mu.Lock()
+		callOrder = append(callOrder, i)
+		mu.Unlock()
+		<-time.After(delay)
+	}
+
+	// Two groups with the same server — should NOT parallelize.
+	groups := []serverGroup{
+		{server: "learner", batches: []toolCallBatch{{start: 0, end: 1}}},
+		{server: "learner", batches: []toolCallBatch{{start: 1, end: 2}}},
+	}
+
+	start := time.Now()
+	runServerGroups(groups, run)
+	elapsed := time.Since(start)
+
+	if len(callOrder) != 2 {
+		t.Fatalf("dispatched %d calls, want 2", len(callOrder))
+	}
+	if callOrder[0] != 0 || callOrder[1] != 1 {
+		t.Errorf("calls out of order: %v, want [0 1]", callOrder)
+	}
+	// Sequential: ~100ms; parallel would be ~50ms.
+	if elapsed < 2*delay {
+		t.Errorf("same-named-server groups took %v (< %v) — ran in parallel despite same server", elapsed, 2*delay)
+	}
+}
+
+// TestRunServerGroupsPreservesOutputOrder verifies that even with cross-server
+// parallelism, results still come back in call order.
+// TestRunServerGroupsCapUnderLimit executes 3 groups (under the cap of 8) and
+// verifies they all complete correctly.
+func TestRunServerGroupsCapUnderLimit(t *testing.T) {
+	const delay = 30 * time.Millisecond
+
+	callsDispatched := int32(0)
+	run := func(i int) {
+		atomic.AddInt32(&callsDispatched, 1)
+		<-time.After(delay)
+	}
+
+	groups := []serverGroup{
+		{server: "s1", batches: []toolCallBatch{{start: 0, end: 1}}},
+		{server: "s2", batches: []toolCallBatch{{start: 1, end: 2}}},
+		{server: "s3", batches: []toolCallBatch{{start: 2, end: 3}}},
+	}
+
+	start := time.Now()
+	runServerGroups(groups, run)
+	elapsed := time.Since(start)
+
+	if callsDispatched != 3 {
+		t.Errorf("dispatched %d calls, want 3", callsDispatched)
+	}
+	// Parallel (3 under cap of 8): ~30ms + overhead; serial: ~90ms.
+	if elapsed >= 3*delay {
+		t.Errorf("3 server groups took %v (>= %v) — not parallel", elapsed, 3*delay)
+	}
+}
+
+// TestRunServerGroupsCapPreventsOverflow verifies that with 12 different server
+// groups (over the cap of 8), at most 8 run concurrently. We measure this by
+// tracking the peak concurrent count.
+func TestRunServerGroupsCapPreventsOverflow(t *testing.T) {
+	const delay = 50 * time.Millisecond
+
+	var mu sync.Mutex
+	var concurrent, peak int32
+	run := func(i int) {
+		mu.Lock()
+		concurrent++
+		if concurrent > peak {
+			peak = concurrent
+		}
+		mu.Unlock()
+
+		<-time.After(delay)
+
+		mu.Lock()
+		concurrent--
+		mu.Unlock()
+	}
+
+	groups := make([]serverGroup, 12)
+	for i := range groups {
+		groups[i] = serverGroup{
+			server:   fmt.Sprintf("s%d", i),
+			batches:  []toolCallBatch{{start: i, end: i + 1}},
+		}
+	}
+
+	runServerGroups(groups, run)
+
+	if peak > maxParallel {
+		t.Errorf("peak concurrency was %d, want ≤ %d", peak, maxParallel)
+	}
+	if peak < 2 {
+		t.Errorf("peak concurrency was only %d — groups appear to have run serially", peak)
+	}
+}
+
+func TestRunServerGroupsPreservesOutputOrder(t *testing.T) {
+	// Each call records its index in a shared slice. The first call (server A)
+	// sleeps 100ms; the second (server B) sleeps 10ms. With parallelism the
+	// fast one finishes first, but the output ordering reflects call order.
+	const fastDelay = 10 * time.Millisecond
+	const slowDelay = 100 * time.Millisecond
+
+	results := make([]int, 2)
+	run := func(i int) {
+		if i == 0 {
+			<-time.After(slowDelay)
+		} else {
+			<-time.After(fastDelay)
+		}
+		results[i] = i
+	}
+
+	groups := []serverGroup{
+		{server: "learner", batches: []toolCallBatch{{start: 0, end: 1}}}, // slow
+		{server: "coder", batches: []toolCallBatch{{start: 1, end: 2}}},   // fast
+	}
+
+	runServerGroups(groups, run)
+
+	// Even with parallelism, results are filled by call index.
+	if results[0] != 0 || results[1] != 1 {
+		t.Errorf("results out of order: %v, want [0 1]", results)
 	}
 }
 

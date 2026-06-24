@@ -8,6 +8,7 @@ import (
 	"io"
 	"runtime/debug"
 	"strings"
+	"time"
 
 	"reasonix/internal/event"
 	"reasonix/internal/jobs"
@@ -132,6 +133,7 @@ type TaskTool struct {
 	baseModel         string
 	baseEffort        string
 	identityProfile   func(modelRef, effort string) (string, string)
+	progress          *ProgressFile
 }
 
 // NewTaskTool wires a task tool to the parent agent's environment so its
@@ -180,6 +182,14 @@ func (t *TaskTool) WithTranscripts(store *SubagentStore, workspaceRoot, baseMode
 
 func (t *TaskTool) WithTranscriptIdentityResolver(resolve func(modelRef, effort string) (string, string)) *TaskTool {
 	t.identityProfile = resolve
+	return t
+}
+
+// WithProgress enables progress file tracking for this task tool. When set,
+// completed sub-agents write entries to the progress file and new sub-agents
+// receive the progress context in their prompt.
+func (t *TaskTool) WithProgress(pf *ProgressFile) *TaskTool {
+	t.progress = pf
 	return t
 }
 
@@ -319,13 +329,14 @@ func (t *TaskTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 					err = errors.Join(panicErr, t.transcripts.SaveFailed(run))
 				}
 			}()
-			answer, err := t.runSubSession(jobCtx, p.Prompt, subReg, nested, maxSteps, prov, pricing, ctxWin, run.Session)
+			answer, err := t.runSubSession(jobCtx, p.Prompt, subReg, nested, maxSteps, prov, pricing, ctxWin, run.Session, t.ProgressContext())
 			if err != nil {
 				return FormatSubagentResult("", run.Ref, true), errors.Join(err, t.transcripts.SaveFailed(run))
 			}
 			if err := t.transcripts.SaveCompleted(run); err != nil {
 				return FormatSubagentResult("", run.Ref, true), errors.Join(err, t.transcripts.SaveFailed(run))
 			}
+			t.writeProgressEntry(p.Description, p.Prompt, answer, "done")
 			return FormatSubagentResult(answer, run.Ref, false), nil
 		})
 		if run != nil && run.Ref != "" {
@@ -336,7 +347,7 @@ func (t *TaskTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 
 	// Foreground: run synchronously, nesting events under this call.
 	defer run.Release()
-	answer, err := t.runSubSession(ctx, p.Prompt, subReg, subSink(ctx), maxSteps, prov, pricing, ctxWin, run.Session)
+	answer, err := t.runSubSession(ctx, p.Prompt, subReg, subSink(ctx), maxSteps, prov, pricing, ctxWin, run.Session, t.ProgressContext())
 	if err != nil {
 		return "", errors.Join(err, t.transcripts.SaveFailed(run))
 	}
@@ -344,6 +355,7 @@ func (t *TaskTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 		if err := t.transcripts.SaveCompleted(run); err != nil {
 			return "", errors.Join(err, t.transcripts.SaveFailed(run))
 		}
+		t.writeProgressEntry(p.Description, p.Prompt, answer, "done")
 		return FormatSubagentResult(answer, run.Ref, false), nil
 	}
 	return answer, nil
@@ -500,7 +512,7 @@ func (t *TaskTool) resolveSubSessionRuntime(modelRef, effort string) (provider.P
 	return prov, pricing, ctxWin, nil
 }
 
-func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *tool.Registry, sink event.Sink, maxSteps int, prov provider.Provider, pricing *provider.Pricing, ctxWin int, sess *Session) (string, error) {
+func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *tool.Registry, sink event.Sink, maxSteps int, prov provider.Provider, pricing *provider.Pricing, ctxWin int, sess *Session, progressCtx ...string) (string, error) {
 	return RunSubAgentWithSession(ctx, prov, subReg, sess, prompt, Options{
 		MaxSteps:          maxSteps,
 		Temperature:       t.temperature,
@@ -515,7 +527,7 @@ func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *too
 		ArchiveDir:        t.archiveDir,
 		KeepPolicy:        t.keepPolicy,
 		ReasoningLanguage: ReasoningLanguageFromContext(ctx),
-	}, sink)
+	}, sink, progressCtx...)
 }
 
 func FormatSubagentResult(answer, ref string, failed bool) string {
@@ -534,9 +546,16 @@ func FormatSubagentResult(answer, ref string, failed bool) string {
 // RunSubAgentWithSession continues an existing sub-agent session with prompt and
 // returns the latest final assistant answer. Fresh sub-agents pass a newly-created
 // session; continued sub-agents pass a loaded transcript session.
-func RunSubAgentWithSession(ctx context.Context, prov provider.Provider, reg *tool.Registry, sess *Session, prompt string, opts Options, sink event.Sink) (string, error) {
+// progressCtx, when non-empty, is prepended to the prompt as a user message
+// prefix. This injects progress context without modifying the system prompt,
+// preserving DeepSeek's prefix cache stability.
+func RunSubAgentWithSession(ctx context.Context, prov provider.Provider, reg *tool.Registry, sess *Session, prompt string, opts Options, sink event.Sink, progressCtx ...string) (string, error) {
 	if sess == nil {
 		return "", fmt.Errorf("sub-agent session is nil")
+	}
+	// Prepend progress context to prompt if provided (user message, not system prompt)
+	if len(progressCtx) > 0 && strings.TrimSpace(progressCtx[0]) != "" {
+		prompt = "## Current Progress\n\n" + progressCtx[0] + "\n\n## Task\n\n" + prompt
 	}
 	sub := New(prov, reg, sess, opts, sink)
 	if err := sub.Run(ctx, prompt); err != nil {
@@ -610,4 +629,45 @@ func subSinkFor(parentID string, parent event.Sink) event.Sink {
 			parent.Emit(e)
 		}
 	})
+}
+
+// writeProgressEntry appends a completion entry to the progress file. It is
+// best-effort — errors are logged but never block the sub-agent result.
+func (t *TaskTool) writeProgressEntry(description, prompt, answer, status string) {
+	if t.progress == nil {
+		return
+	}
+	state, _ := t.progress.Read()
+	task := description
+	if task == "" {
+		// Use first 80 chars of prompt as task description
+		task = strings.TrimSpace(prompt)
+		if len(task) > 80 {
+			task = task[:80] + "..."
+		}
+	}
+	entry := ProgressEntry{
+		Status:    status,
+		Task:      task,
+		UpdatedAt: time.Now().UTC(),
+	}
+	switch status {
+	case "done":
+		state.Completed = append(state.Completed, entry)
+	case "in_progress":
+		state.InProgress = append(state.InProgress, entry)
+	case "blocked":
+		state.Blocked = append(state.Blocked, entry)
+	}
+	_ = t.progress.Write(state)
+}
+
+// ProgressContext returns the progress file content for injection into a
+// sub-agent's prompt. Returns empty string if no progress file is configured
+// or the file doesn't exist.
+func (t *TaskTool) ProgressContext() string {
+	if t.progress == nil {
+		return ""
+	}
+	return t.progress.ReadAsString()
 }

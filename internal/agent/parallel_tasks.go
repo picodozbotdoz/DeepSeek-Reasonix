@@ -269,7 +269,7 @@ func (p *ParallelTasksTool) Execute(ctx context.Context, args json.RawMessage) (
 					CompactForceRatio: p.taskTool.compactForceRatio,
 					ArchiveDir:        p.taskTool.archiveDir,
 					KeepPolicy:        p.taskTool.keepPolicy,
-				}, nested)
+				}, nested, p.taskTool.ProgressContext())
 
 				if runErr != nil {
 					sink.Emit(event.Event{

@@ -74,14 +74,12 @@ func (f *acpFactory) NewSession(ctx context.Context, p acp.SessionParams) (*cont
 		return nil, fmt.Errorf("session cwd must be an absolute path: %s", root)
 	}
 	return boot.Build(ctx, boot.Options{
-		Model:                    firstNonEmpty(p.Model, f.model),
-		RequireKey:               true,
-		Sink:                     p.Sink,
-		EffortOverride:           p.EffortOverride,
-		Stderr:                   os.Stderr,
-		WorkspaceRoot:            root,
-		ExtraPlugins:             p.MCPServers,
-		CleanupPendingReconciler: acp.ReconcileCleanupPending,
+		Model:         f.model,
+		RequireKey:    true,
+		Sink:          p.Sink,
+		Stderr:        os.Stderr,
+		WorkspaceRoot: root,
+		ExtraPlugins:  p.MCPServers,
 	})
 }
 
@@ -197,78 +195,6 @@ func acpBuiltinTools(cfg *config.Config, cwd string, writeRoots []string) []tool
 		ProxySpec:   cfg.NetworkProxySpec(),
 	}
 	return ws.Tools(cfg.Tools.Enabled...)
-}
-
-func acpModelOptions(cfg *config.Config) ([]acp.SessionConfigSelectOption, []acp.ModelInfo) {
-	if cfg == nil {
-		return nil, nil
-	}
-	var options []acp.SessionConfigSelectOption
-	var models []acp.ModelInfo
-	for i := range cfg.Providers {
-		p := &cfg.Providers[i]
-		if !p.Configured() {
-			continue
-		}
-		for _, model := range p.ChatModelList() {
-			ref := p.Name + "/" + model
-			options = append(options, acp.SessionConfigSelectOption{
-				Value:       ref,
-				Name:        ref,
-				Description: p.Name,
-			})
-			models = append(models, acp.ModelInfo{
-				ModelID:     ref,
-				Name:        ref,
-				Description: p.Name,
-			})
-		}
-	}
-	return options, models
-}
-
-func hasModelOption(options []acp.SessionConfigSelectOption, ref string) bool {
-	for _, opt := range options {
-		if opt.Value == ref {
-			return true
-		}
-	}
-	return false
-}
-
-func acpEffortOptions(levels []string) []acp.SessionConfigSelectOption {
-	out := make([]acp.SessionConfigSelectOption, 0, len(levels))
-	for _, level := range levels {
-		out = append(out, acp.SessionConfigSelectOption{Value: level, Name: effortOptionName(level)})
-	}
-	return out
-}
-
-func effortOptionName(level string) string {
-	if level == "" {
-		return ""
-	}
-	if level == "xhigh" {
-		return "XHigh"
-	}
-	return strings.ToUpper(level[:1]) + level[1:]
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
-}
-
-func cloneStringPtr(p *string) *string {
-	if p == nil {
-		return nil
-	}
-	cp := *p
-	return &cp
 }
 
 func acpTaskProfileDefaults(cfg *config.Config) (string, string) {

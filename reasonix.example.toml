@@ -103,8 +103,17 @@ effort         = "high"
 enabled = []   # empty = all built-in tools
 bash_timeout_seconds = 120   # foreground safety cap; set 0 for no tool-local cap
 
-[tools.background_jobs]
-stalled_warning_seconds = 900   # warn once per background job after this many quiet seconds; 0 disables
+# CodeGraph code intelligence (symbol/call-graph search via tree-sitter + SQLite),
+# a built-in MCP server giving the agent codegraph_* search / context / explore /
+# trace / node tools. Off by default for first-run sessions. Once enabled, the
+# runtime is fetched into a per-version cache when missing (auto_install);
+# .codegraph/ is then initialised (fast) and CodeGraph's daemon indexes in the
+# background once enabled.
+# [codegraph]
+# enabled      = false
+# auto_install = true
+# path         = ""   # empty = cache, then PATH, then a bundle beside reasonix
+# project_root = ""   # optional: where .codegraph/ lives (for multi-dir setups)
 
 # Skills are invokable playbooks (SKILL.md / <name>.md with frontmatter), found
 # under .reasonix/skills, .agents/skills, .agent/skills, .claude/skills (project)
@@ -186,3 +195,11 @@ stalled_warning_seconds = 900   # warn once per background job after this many q
 # token      = ""          # pre-shared token for auth_mode = "token" (auto-generated if empty)
 # password_hash = ""       # bcrypt hash for auth_mode = "password". Generate with: reasonix serve --hash-password <password>
 # behind_proxy = false      # set true when behind a trusted reverse proxy (nginx, Caddy, etc.) that sets X-Forwarded-* headers
+
+# Context Analysis Hooks (cahooks): run LLM analysis on the context window at
+# various lifecycle points and write insights to .reasonix/meta/. The LLM call
+# reuses the exact same prefix as the next normal turn (~100% cache hit).
+# Hook definitions live in .reasonix/cahooks.json (project) or
+# ~/.reasonix/cahooks.json (global). See docs/reasonix/REQ_DESIGN_DS-CONTEXT-WINDOW-INTELLIGENCE.md
+# [cahooks]
+# enabled = false   # master switch; false disables all cahooks

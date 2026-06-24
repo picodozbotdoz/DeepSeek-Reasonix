@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"reasonix/internal/agent"
+	"reasonix/internal/cahooks"
+	"reasonix/internal/codegraph"
 	"reasonix/internal/command"
 	"reasonix/internal/config"
 	"reasonix/internal/control"
@@ -319,6 +321,76 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	eagerSpecs := PluginSpecsForRoot(eagerEntries, root)
 	bgSpecs := PluginSpecsForRoot(bgEntries, root)
 
+	// CodeGraph is a built-in MCP server fetched on first use. When it resolves,
+	// inject it as one more stdio plugin pinned to the project root (it is
+	// cwd-aware); EnsureInit only creates .codegraph/ (fast, size-independent),
+	// serve's daemon then indexes in the background, so startup never blocks even
+	// on a large repo. When it is not yet installed, fetch it in the background
+	// (one-time, ~45MB) if auto_install is on — startup still never blocks, the
+	// tools come online next session — otherwise point the user at the explicit
+	// install command. A failed init or fetch is a notice, not fatal.
+	//
+	// CodeGraph is fixed to background startup. Legacy tier values are ignored so
+	// enabling it never blocks chat startup.
+	if cfg.Codegraph.Enabled && !tokenEconomy {
+		bin, ok := codegraph.Resolve(cfg.Codegraph.Path)
+		switch {
+		case ok && !codegraph.IndexableRoot(root):
+			sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn,
+				Text: "codegraph: project root is a filesystem root — skipped to avoid indexing the whole volume"})
+		case ok:
+			spec := plugin.Spec{
+				Name:              "codegraph",
+				StripRawPrefix:    "codegraph_",
+				Command:           bin,
+				Args:              []string{"serve", "--mcp"},
+				Dir:               root,
+				ReadOnlyToolNames: codegraph.ReadOnlyToolNames(),
+				// The daemon walks and indexes the whole tree; below-normal
+				// priority keeps it from starving the user's machine (#3797).
+				LowPriority: true,
+			}
+			if cfg.Codegraph.ProjectRoot != "" {
+				spec.Args = append(spec.Args, "--path", cfg.Codegraph.ProjectRoot)
+			}
+			initRoot := root
+			if cfg.Codegraph.ProjectRoot != "" {
+				initRoot = cfg.Codegraph.ProjectRoot
+			}
+			warm := codegraph.Initialized(initRoot)
+			if err := codegraph.EnsureInit(ctx, bin, initRoot); err != nil {
+				sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn,
+					Text: "codegraph: init failed (" + err.Error() + ") — symbol-graph tools disabled this session"})
+				break
+			}
+			bgNotice := func() {
+				if !warm {
+					sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo,
+						Text: "codegraph: preparing code-intelligence tools in the background — tools will appear when ready"})
+				}
+			}
+			bgSpecs = append(bgSpecs, spec)
+			bgNotice()
+		case cfg.Codegraph.AutoInstall:
+			notify := func(msg string) { sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: msg}) }
+			notify("codegraph: fetching code-intelligence runtime in the background (one-time) — symbol-graph tools available next session")
+			codegraphClient, err := netclient.NewHTTPClient(proxySpec, netclient.TransportOptions{})
+			if err != nil {
+				notify("codegraph: install skipped (" + err.Error() + ")")
+			} else {
+				go func() {
+					if _, err := codegraph.InstallWithClient(context.WithoutCancel(ctx), codegraphClient, nil); err != nil {
+						notify("codegraph: install failed (" + err.Error() + ") — using grep/glob; retries next session")
+					} else {
+						notify("codegraph: installed — symbol-graph tools available next session")
+					}
+				}()
+			}
+		default:
+			sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo,
+				Text: "codegraph: not installed — run `reasonix codegraph install` to enable symbol-graph tools"})
+		}
+	}
 	if !tokenEconomy {
 		eagerSpecs = append(eagerSpecs, extraSpecs...)
 	}
@@ -543,8 +615,25 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			taskModel, taskEffort, resolveSubagentProvider).
 			WithTranscripts(subagentStore, root, modelName, entry.Effort).
 			WithTranscriptIdentityResolver(subagentIdentity)
+
+		// Wire progress file into task tool if available.
+		if root != "" {
+			sharedDir := filepath.Join(root, "_shared")
+			if _, err := os.Stat(sharedDir); err == nil {
+				tt.WithProgress(agent.NewProgressFile(sharedDir))
+			}
+		}
+
 		reg.Add(tt)
 		reg.Add(agent.NewParallelTasksTool(tt, reg))
+
+		// Wire mission tool if shared directory exists.
+		if root != "" {
+			sharedDir := filepath.Join(root, "_shared")
+			missionPath := filepath.Join(sharedDir, "MISSION.toml")
+			reg.Add(agent.NewMissionTool(agent.NewMissionManager(missionPath), sink))
+		}
+
 		return "enabled task."
 	}
 	if !tokenEconomy {
@@ -798,6 +887,47 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 				}
 				return "enabled " + strings.Join(names, ", ") + ".", nil
 			},
+			codegraph: func(context.Context) (string, error) {
+				if !cfg.Codegraph.Enabled {
+					return "", fmt.Errorf("codegraph is disabled in config")
+				}
+				bin, ok := codegraph.Resolve(cfg.Codegraph.Path)
+				if !ok {
+					return "", fmt.Errorf("codegraph is not installed")
+				}
+				initRoot := root
+				if cfg.Codegraph.ProjectRoot != "" {
+					initRoot = cfg.Codegraph.ProjectRoot
+				}
+				if !codegraph.IndexableRoot(initRoot) {
+					return "", fmt.Errorf("codegraph: project root is a filesystem root — skipped to avoid indexing the whole volume")
+				}
+				if err := codegraph.EnsureInit(ctx, bin, initRoot); err != nil {
+					return "", fmt.Errorf("codegraph init: %w", err)
+				}
+				spec := plugin.Spec{
+					Name:              "codegraph",
+					StripRawPrefix:    "codegraph_",
+					Command:           bin,
+					Args:              []string{"serve", "--mcp"},
+					Dir:               root,
+					ReadOnlyToolNames: codegraph.ReadOnlyToolNames(),
+					LowPriority:       true,
+				}
+				if cfg.Codegraph.ProjectRoot != "" {
+					spec.Args = append(spec.Args, "--path", cfg.Codegraph.ProjectRoot)
+				}
+				if opts.Stderr != nil {
+					spec.Stderr = opts.Stderr
+				}
+				tools, err := pluginHost.Add(ctx, spec)
+				if err != nil {
+					return "", err
+				}
+				reg.RemovePrefix(plugin.ToolPrefix(spec.Name))
+				names := addTools(reg, tools)
+				return "enabled codegraph tools: " + strings.Join(names, ", ") + ".", nil
+			},
 			mcp: func(_ context.Context, name string) (string, error) {
 				spec, ok := onDemandMCPSpecs[name]
 				if !ok {
@@ -837,6 +967,17 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	}
 
 	execSess := agent.NewSession(sysPrompt)
+
+	// Create budget tracker if any budget limits are configured.
+	var budgetTracker *agent.BudgetTracker
+	if cfg.Agent.MaxTokensPerTask > 0 || cfg.Agent.MaxCostPerMission > 0 || cfg.Agent.MaxTurnsPerTask > 0 {
+		budgetTracker = agent.NewBudgetTracker(agent.BudgetLimits{
+			MaxTokens:  cfg.Agent.MaxTokensPerTask,
+			MaxCostUSD: cfg.Agent.MaxCostPerMission,
+			MaxTurns:   cfg.Agent.MaxTurnsPerTask,
+		})
+	}
+
 	executor := agent.New(execProv, reg, execSess, agent.Options{
 		MaxSteps:             maxSteps,
 		Temperature:          cfg.Agent.Temperature,
@@ -854,7 +995,17 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		KeepPolicy:           keepPolicy,
 		ReasoningLanguage:    cfg.ReasoningLanguage(),
 		PlanModeAllowedTools: cfg.Agent.PlanModeAllowedTools,
+		Budget:               budgetTracker,
 	}, sink)
+
+	// Wire cahooks if enabled
+	if cfg.CAHooks.Enabled {
+		home, _ := os.UserHomeDir()
+		cahooksCfg := cahooks.LoadAll(root, home)
+		if cahooksCfg != nil && len(cahooksCfg.Hooks) > 0 {
+			executor.SetCAHooks(cahooks.NewManager(cahooksCfg, execProv, sink))
+		}
+	}
 
 	var runner agent.Runner = executor
 	label := entry.Model
@@ -906,6 +1057,30 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		}
 	}
 
+	// Resolve the optional clarify provider for prompt refinement.
+	// Defaults to the executor's provider when clarify_model is unset.
+	clarifyProv := execProv
+	if cm := cfg.ClarifyModel(); cm != "" {
+		ce, ok := cfg.ResolveModel(cm)
+		if !ok {
+			sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn,
+				Text: fmt.Sprintf("clarify_model %q not found — using default model for prompt refinement", cm)})
+		} else {
+			cp, err := NewProviderWithProxy(ce, proxySpec)
+			if err != nil {
+				sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn,
+					Text: fmt.Sprintf("clarify_model %q failed: %s — using default model", cm, err)})
+			} else {
+				clarifyProv = cp
+			}
+		}
+	}
+
+	// Add async delegation guidance when worker plugins are configured
+	if guidance := asyncDelegationGuidance(autoStartEntries); guidance != "" {
+		sysPrompt += "\n\n" + guidance
+	}
+
 	ctrlOpts := control.Options{
 		Runner:                 runner,
 		Executor:               executor,
@@ -940,6 +1115,29 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		OnRemember: func(rule string) control.RememberResult {
 			return rememberPermissionRule(root, rule)
 		},
+		ClarifyProvider: clarifyProv,
+		ClarifyConfig:   cfg.Clarify,
+	}
+
+	// Wire budget tracker into controller options.
+	if budgetTracker != nil {
+		ctrlOpts.Budget = budgetTracker
+	}
+
+	// Wire progress file for long-running task tracking.
+	if root != "" {
+		sharedDir := filepath.Join(root, "_shared")
+		if _, err := os.Stat(sharedDir); err == nil {
+			pf := agent.NewProgressFile(sharedDir)
+			ctrlOpts.Progress = pf
+		}
+	}
+
+	// Wire mission manager for long-running task orchestration.
+	if root != "" {
+		sharedDir := filepath.Join(root, "_shared")
+		missionPath := filepath.Join(sharedDir, "MISSION.toml")
+		ctrlOpts.Mission = agent.NewMissionManager(missionPath)
 	}
 	if classifier != nil {
 		ctrlOpts.Classifier = classifier
